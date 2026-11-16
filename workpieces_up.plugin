@@ -1,0 +1,2627 @@
+import base64
+import gzip
+import json
+import os
+import shutil
+import uuid
+
+from android.graphics import Bitmap, BitmapFactory, BitmapShader, Canvas, Color, Paint, PorterDuff, PorterDuffColorFilter, RectF, Shader, Typeface
+from android.media import ThumbnailUtils
+from android.content import Intent
+from android.graphics.drawable import GradientDrawable
+from android.text import InputType, TextUtils
+from android.util import TypedValue
+from android.view import Gravity, View
+from android.widget import EditText, FrameLayout, HorizontalScrollView, ImageView, LinearLayout, ScrollView, TextView
+from java import jarray, jbyte, jint
+from java.lang.ref import WeakReference
+
+from android_utils import OnClickListener, OnLongClickListener, run_on_ui_thread
+from base_plugin import AppEvent, BasePlugin, MethodHook, MenuItemData, MenuItemType
+from client_utils import get_last_fragment, run_on_queue, send_audio, send_document, send_photo, send_text, send_video
+from hook_utils import find_class, get_private_field
+from org.telegram.messenger import AndroidUtilities, FileLoader, UserConfig
+from org.telegram.ui.ActionBar import Theme
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+
+__id__ = "workpieces_up"
+__name__ = "Workpieces Up"
+__description__ = "Создавайте свои заготовки и отправляйте их в любом чате! Можете добавить файлы, фото, видео, аудио, премиум эмодзи, markdown-html форматирование. Расформируйте все по папкам, хранятся они локально на вашем устройстве, так что точно не пропадут!"
+__author__ = "@lddcq & @bladeplugins"
+__version__ = "1.0.0"
+__icon__ = "bladeplugins/0"
+__app_version__ = ">=12.10.6"
+__sdk_version__ = ">=1.4.5.0"
+__category__ = ["chats", "tools"]
+
+ENTER_VIEW = "org.telegram.ui.Components.ChatActivityEnterView"
+BUTTON_TAG = "workpieces_up_button"
+STORAGE_KEY = "workpieces_data"
+PICKER_REQUEST_CODE = 47291
+
+BUTTON_ICONS = ["msg_quick_reply", "msg_quickreply", "msg_quickreplies", "msg_list"]
+PICKER_TYPES = {"file": "*/*", "photo": "image/*", "video": "video/*", "audio": "audio/*"}
+MEDIA_ICONS = {"photo": "🖼", "video": "🎬", "audio": "🎵", "document": "📎"}
+ICON_FILES = {}
+MATCH = -1
+WRAP = -2
+
+MARKDOWN_HINT = "*жирный*  _курсив_  __подчёркнутый__  ~зачёркнутый~  ||спойлер||  `код`  [текст](ссылка)  > цитата"
+
+
+def dp(value):
+    return int(AndroidUtilities.dp(value))
+
+
+def color(names, fallback):
+    if isinstance(names, str):
+        names = [names]
+    for name in names:
+        try:
+            return int(Theme.getColor(getattr(Theme, name)))
+        except Exception:
+            pass
+    return int(Color.parseColor(fallback))
+
+
+def alpha(value, a):
+    return int(Color.argb(a, Color.red(value), Color.green(value), Color.blue(value)))
+
+
+def rounded(value, radius):
+    shape = GradientDrawable()
+    shape.setColor(value)
+    shape.setCornerRadius(float(dp(radius)))
+    return shape
+
+
+def ripple(kind=2):
+    try:
+        return Theme.createSelectorDrawable(color("key_listSelector", "#1F000000"), kind)
+    except Exception:
+        return None
+
+
+def drawable_id(ctx, names):
+    for name in names:
+        try:
+            found = int(ctx.getResources().getIdentifier(name, "drawable", ctx.getPackageName()))
+            if found:
+                return found
+        except Exception:
+            pass
+    return 0
+
+
+def make_icon(ctx, names, tint, fallback):
+    found = drawable_id(ctx, names)
+    if found:
+        view = ImageView(ctx)
+        view.setScaleType(ImageView.ScaleType.CENTER)
+        view.setImageDrawable(ctx.getResources().getDrawable(found).mutate())
+        view.setColorFilter(PorterDuffColorFilter(tint, PorterDuff.Mode.SRC_IN))
+        return view
+    view = TextView(ctx)
+    view.setText(fallback)
+    view.setTextColor(tint)
+    view.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 22)
+    view.setGravity(Gravity.CENTER)
+    return view
+
+
+def mix(first, second, amount):
+    result = 0xFF
+    for shift in (16, 8, 0):
+        one = (first >> shift) & 255
+        two = (second >> shift) & 255
+        result = (result << 8) | int(one * (1 - amount) + two * amount)
+    return result - (1 << 32) if result >= (1 << 31) else result
+
+
+def brightness(value):
+    value = int(value) & 0xFFFFFFFF
+    return (0.299 * ((value >> 16) & 255) + 0.587 * ((value >> 8) & 255) + 0.114 * (value & 255)) / 255.0
+
+
+def light_color(names, fallback, minimum=0.2):
+    """Первый цвет темы, который не выглядит чёрным; иначе запасной."""
+    if isinstance(names, str):
+        names = [names]
+    for name in names:
+        try:
+            found = int(Theme.getColor(getattr(Theme, name)))
+            if brightness(found) >= minimum:
+                return found
+        except Exception:
+            pass
+    return int(Color.parseColor(fallback))
+
+
+def accent_color():
+    return light_color(["key_dialogTextBlue", "key_chat_messagePanelSend", "key_windowBackgroundWhiteBlueText"], "#3390EC")
+
+
+def icon_color():
+    return accent_color()
+
+
+def field_text():
+    return mix(accent_color(), Color.parseColor("#000000"), 0.3)
+
+
+def field_background(radius):
+    accent = accent_color()
+    shape = rounded(Color.parseColor("#FFFFFF"), radius)
+    try:
+        shape.setStroke(dp(1), alpha(accent, 220))
+    except Exception:
+        pass
+    return shape
+
+
+def style_field(field):
+    accent = accent_color()
+    field.setTextColor(field_text())
+    field.setHintTextColor(Color.parseColor("#8E9AA8"))
+    field.setBackground(field_background(12))
+    try:
+        field.setHighlightColor(alpha(accent, 90))
+    except Exception:
+        pass
+    try:
+        cursor = GradientDrawable()
+        cursor.setColor(accent)
+        cursor.setSize(dp(2), dp(20))
+        field.setTextCursorDrawable(cursor)
+    except Exception:
+        pass
+
+
+def recolor_lottie(node, rgb):
+    """Заменяет цвета заливок и обводок в Lottie-данных на rgb (0..1)."""
+    if isinstance(node, dict):
+        value = node.get("c")
+        if isinstance(value, dict) and "k" in value:
+            keys = value["k"]
+            if value.get("a") == 0 and isinstance(keys, list) and len(keys) >= 3:
+                value["k"] = [rgb[0], rgb[1], rgb[2]] + list(keys[3:])
+            elif value.get("a") == 1 and isinstance(keys, list):
+                for frame in keys:
+                    for field in ("s", "e"):
+                        if isinstance(frame, dict) and isinstance(frame.get(field), list) and len(frame[field]) >= 3:
+                            frame[field] = [rgb[0], rgb[1], rgb[2]] + list(frame[field][3:])
+        for child in node.values():
+            recolor_lottie(child, rgb)
+    elif isinstance(node, list):
+        for child in node:
+            recolor_lottie(child, rgb)
+
+
+def icon_file(ctx, name, tint=None):
+    # исходные .tgs белые: перекрашиваем в нужный цвет, чтобы значок был виден на любом фоне
+    rgb = int(tint if tint is not None else icon_color()) & 0xFFFFFF
+    key = "%s_%06x" % (name, rgb)
+    path = ICON_FILES.get(key)
+    if path and os.path.isfile(path):
+        return path
+    directory = os.path.join(str(ctx.getFilesDir().getAbsolutePath()), "workpieces_up", "icons")
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, key + ".tgs")
+    if not os.path.isfile(path) or os.path.getsize(path) < 50:
+        data = json.loads(gzip.decompress(base64.b64decode(ICON_DATA[name])).decode("utf-8"))
+        recolor_lottie(data, [((rgb >> 16) & 255) / 255.0, ((rgb >> 8) & 255) / 255.0, (rgb & 255) / 255.0])
+        packed = gzip.compress(json.dumps(data, separators=(",", ":")).encode("utf-8"), 9)
+        temp = path + ".tmp"
+        with open(temp, "wb") as handle:
+            handle.write(packed)
+        os.replace(temp, path)
+    ICON_FILES[key] = path
+    return path
+
+
+LOTTIE_ERRORS = []
+LOTTIE_REPORTED = []
+
+
+def frames_ok(drawable):
+    try:
+        return int(drawable.getFramesCount()) > 0
+    except Exception:
+        return True
+
+
+LOTTIE_INFO = []
+
+
+def lottie_args(types, path, pixels):
+    from java.io import File
+
+    has_file = any(str(t.getName()) == "java.io.File" for t in types)
+    booleans = [i for i, t in enumerate(types) if str(t.getName()) == "boolean"]
+    ints = 0
+    strings = 0
+    args = []
+    for index, t in enumerate(types):
+        name = str(t.getName())
+        if name == "java.io.File":
+            args.append(File(path))
+        elif name == "java.lang.String":
+            if has_file:
+                args.append(None)
+            elif strings == 0:
+                with open(path, "rb") as handle:
+                    args.append(gzip.decompress(handle.read()).decode("utf-8"))
+            else:
+                args.append(os.path.basename(path))
+            strings += 1
+        elif name == "int":
+            args.append(jint(pixels if ints < 2 else 0))
+            ints += 1
+        elif name == "long":
+            args.append(0)
+        elif name == "boolean":
+            # последний boolean — запуск декодирования, остальные (limitFps, precache) выключены
+            args.append(bool(len(booleans) > 1 and index == booleans[-1]))
+        else:
+            args.append(None)
+    return args
+
+
+def find_lottie_class(ctx, name="org.telegram.ui.Components.RLottieDrawable"):
+    getters = [
+        lambda: find_class(name),
+        lambda: ctx.getClass().getClassLoader().loadClass(name),
+        lambda: __import__("java").jclass("java.lang.Class").forName(name),
+        lambda: AndroidUtilities.getClass().getClassLoader().loadClass(name),
+    ]
+    for getter in getters:
+        try:
+            found = getter()
+            if found is not None and hasattr(found, "getDeclaredConstructors"):
+                return found
+        except Exception as error:
+            LOTTIE_ERRORS.append("class: %s %s" % (type(error).__name__, error))
+    return None
+
+
+def direct_attempts(path, pixels):
+    from java.io import File
+    from org.telegram.ui.Components import RLottieDrawable
+
+    return [
+        lambda: RLottieDrawable(File(path), None, pixels, pixels, None, False, None, 0, True),
+    ]
+
+
+def make_lottie_drawable(path, pixels, ctx=None):
+    lottie_class = find_lottie_class(ctx)
+    if lottie_class is None:
+        for attempt in direct_attempts(path, pixels):
+            try:
+                drawable = attempt()
+                if frames_ok(drawable):
+                    return drawable
+            except Exception as error:
+                LOTTIE_ERRORS.append("%s %s" % (type(error).__name__, error))
+        raise RuntimeError("нет подходящего конструктора")
+    constructors = list(lottie_class.getDeclaredConstructors())
+    if not LOTTIE_INFO:
+        for ctor in constructors:
+            LOTTIE_INFO.append(", ".join(str(t.getSimpleName()) for t in ctor.getParameterTypes()))
+
+    def usable(ctor):
+        names = [str(t.getName()) for t in ctor.getParameterTypes()]
+        if "java.io.File" in names:
+            return 0
+        if "java.lang.String" in names and names.count("int") >= 2:
+            return 1
+        return 2
+
+    last = None
+    for ctor in sorted(constructors, key=usable):
+        if usable(ctor) > 1:
+            continue
+        try:
+            ctor.setAccessible(True)
+            drawable = ctor.newInstance(*lottie_args(ctor.getParameterTypes(), path, pixels))
+            if frames_ok(drawable):
+                return drawable
+            LOTTIE_ERRORS.append("0 кадров")
+        except Exception as error:
+            last = error
+            LOTTIE_ERRORS.append("%s %s" % (type(error).__name__, error))
+    raise last or RuntimeError("нет подходящего конструктора")
+
+
+def show_lottie_report():
+    try:
+        fragment = get_last_fragment()
+        activity = fragment.getParentActivity() if fragment is not None else None
+        dialog = AlertDialogBuilder(activity)
+        dialog.set_title("Анимация не загрузилась")
+        dialog.set_message("Конструкторы RLottieDrawable:\n%s\n\nОшибки:\n%s" % ("\n".join(LOTTIE_INFO) or "нет", "\n".join(e[:220] for e in LOTTIE_ERRORS[-6:])))
+        dialog.set_positive_button("OK", lambda builder, which: builder.dismiss())
+        dialog.show()
+    except Exception:
+        BulletinHelper.show_error(("Анимация: %s" % "; ".join(LOTTIE_ERRORS[-2:]))[:200])
+
+
+def lottie_icon(ctx, name, size, fallback, loop=False, tint=None):
+    try:
+        pixels = dp(size)
+        if tint is None:
+            tint = icon_color()
+        drawable = make_lottie_drawable(icon_file(ctx, name, tint), pixels, ctx)
+        view = ImageView(ctx)
+        view.setScaleType(ImageView.ScaleType.FIT_CENTER)
+        view.setImageDrawable(drawable)
+        for call in (lambda: drawable.setAllowDecodeSingleFrame(True),
+                     lambda: drawable.setCurrentParentView(view),
+                     lambda: drawable.setAutoRepeat(1 if loop else 0),
+                     lambda: drawable.start()):
+            try:
+                call()
+            except Exception as error:
+                LOTTIE_ERRORS.append("%s %s" % (type(error).__name__, error))
+        try:
+            from java import dynamic_proxy
+
+            class Attach(dynamic_proxy(View.OnAttachStateChangeListener)):
+                def onViewAttachedToWindow(self, v):
+                    try:
+                        drawable.setCurrentParentView(v)
+                        drawable.start()
+                    except Exception:
+                        pass
+
+                def onViewDetachedFromWindow(self, v):
+                    pass
+
+            view.addOnAttachStateChangeListener(Attach())
+        except Exception as error:
+            LOTTIE_ERRORS.append("attach: %s %s" % (type(error).__name__, error))
+        return view
+    except Exception as error:
+        LOTTIE_ERRORS.append("итог: %s %s" % (type(error).__name__, error))
+        if not LOTTIE_REPORTED:
+            LOTTIE_REPORTED.append(True)
+            show_lottie_report()
+        view = TextView(ctx)
+        view.setText(fallback)
+        view.setTextColor(tint if tint is not None else icon_color())
+        view.setTextSize(TypedValue.COMPLEX_UNIT_DIP, size * 0.7)
+        view.setGravity(Gravity.CENTER)
+        return view
+
+
+def replay(view):
+    try:
+        drawable = view.getDrawable()
+        drawable.setCurrentFrame(0)
+        drawable.start()
+    except Exception:
+        pass
+
+
+THUMBS = {}
+MEDIA_NAMES = {"photo": "фото", "video": "видео", "audio": "аудио", "document": "файл"}
+
+
+def media_bitmap(entry, size):
+    """Квадратная миниатюра с закруглёнными углами для фото и видео."""
+    path = entry.get("path", "")
+    px = dp(size)
+    key = (path, px)
+    if key in THUMBS:
+        return THUMBS[key]
+    result = None
+    try:
+        source = None
+        if entry.get("type") == "photo":
+            bounds = BitmapFactory.Options()
+            bounds.inJustDecodeBounds = True
+            BitmapFactory.decodeFile(path, bounds)
+            width = int(bounds.outWidth)
+            height = int(bounds.outHeight)
+            sample = 1
+            while width // (sample * 2) >= px and height // (sample * 2) >= px:
+                sample *= 2
+            options = BitmapFactory.Options()
+            options.inSampleSize = sample
+            source = BitmapFactory.decodeFile(path, options)
+        elif entry.get("type") == "video":
+            source = ThumbnailUtils.createVideoThumbnail(path, 1)
+        if source is not None:
+            square = ThumbnailUtils.extractThumbnail(source, px, px)
+            output = Bitmap.createBitmap(px, px, Bitmap.Config.ARGB_8888)
+            paint = Paint(Paint.ANTI_ALIAS_FLAG)
+            paint.setShader(BitmapShader(square, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP))
+            radius = float(dp(8))
+            Canvas(output).drawRoundRect(RectF(0.0, 0.0, float(px), float(px)), radius, radius, paint)
+            result = output
+    except Exception:
+        result = None
+    THUMBS[key] = result
+    return result
+
+
+def thumb_view(ctx, entry, size, on_remove=None, show_name=False):
+    frame = FrameLayout(ctx)
+    accent = accent_color()
+    kind = entry.get("type")
+    bitmap = media_bitmap(entry, size) if kind in ("photo", "video") else None
+    if bitmap is not None:
+        picture = ImageView(ctx)
+        picture.setScaleType(ImageView.ScaleType.CENTER_CROP)
+        picture.setImageBitmap(bitmap)
+        frame.addView(picture, FrameLayout.LayoutParams(dp(size), dp(size)))
+        if kind == "video":
+            play = TextView(ctx)
+            play.setText("▶")
+            play.setTextColor(Color.WHITE)
+            play.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 10)
+            play.setGravity(Gravity.CENTER)
+            play.setBackground(rounded(alpha(Color.BLACK, 130), 11))
+            frame.addView(play, FrameLayout.LayoutParams(dp(22), dp(22), Gravity.CENTER))
+    else:
+        tile = LinearLayout(ctx)
+        tile.setOrientation(LinearLayout.VERTICAL)
+        tile.setGravity(Gravity.CENTER)
+        tile.setBackground(rounded(alpha(accent, 36), 8))
+        tile.setPadding(dp(3), dp(3), dp(3), dp(3))
+        icon = TextView(ctx)
+        icon.setText(MEDIA_ICONS.get(kind, "📎"))
+        icon.setTextSize(TypedValue.COMPLEX_UNIT_DIP, size * 0.4 if not show_name else 22)
+        icon.setGravity(Gravity.CENTER)
+        tile.addView(icon, LinearLayout.LayoutParams(WRAP, WRAP))
+        if show_name:
+            name = TextView(ctx)
+            name.setText(entry.get("name", "файл"))
+            name.setTextColor(field_text())
+            name.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 9)
+            name.setGravity(Gravity.CENTER)
+            name.setMaxLines(2)
+            name.setEllipsize(TextUtils.TruncateAt.END)
+            tile.addView(name, LinearLayout.LayoutParams(MATCH, WRAP))
+        frame.addView(tile, FrameLayout.LayoutParams(dp(size), dp(size)))
+    if on_remove is not None:
+        badge = FrameLayout(ctx)
+        badge.setBackground(rounded(alpha(Color.BLACK, 150), 11))
+        badge.setPadding(dp(4), dp(4), dp(4), dp(4))
+        trash = lottie_icon(ctx, "003", 14, "✕", tint=Color.WHITE)
+        badge.addView(trash, FrameLayout.LayoutParams(dp(14), dp(14)))
+        badge.setOnClickListener(OnClickListener(lambda v: on_remove()))
+        params = FrameLayout.LayoutParams(dp(22), dp(22), Gravity.TOP | Gravity.END)
+        params.setMargins(0, dp(3), dp(3), 0)
+        frame.addView(badge, params)
+    return frame
+
+
+def media_summary(media):
+    counts = {}
+    for entry in media:
+        counts[entry.get("type")] = counts.get(entry.get("type"), 0) + 1
+    parts = ["%d %s" % (n, MEDIA_NAMES.get(k, "файл")) for k, n in counts.items()]
+    return ", ".join(parts)
+
+
+def show_actions(ctx, rows):
+    try:
+        build_actions(ctx, rows)
+    except Exception as error:
+        BulletinHelper.show_error(("Меню: %s %s" % (type(error).__name__, error))[:160])
+        menu = AlertDialogBuilder(ctx)
+
+        def picked(builder, index):
+            builder.dismiss()
+            rows[int(index)][3]()
+
+        menu.set_items([row[0] for row in rows], picked)
+        menu.show()
+
+
+def build_actions(ctx, rows):
+    box = LinearLayout(ctx)
+    box.setOrientation(LinearLayout.VERTICAL)
+    box.setPadding(0, dp(6), 0, dp(6))
+
+    dialog = AlertDialogBuilder(ctx)
+    normal = color("key_dialogTextBlack", "#000000")
+    red = color(["key_dialogTextRed", "key_text_RedBold", "key_dialogRedIcon"], "#E53935")
+
+    for label, icon, emoji, callback, danger in rows:
+        row = LinearLayout(ctx)
+        row.setOrientation(LinearLayout.HORIZONTAL)
+        row.setGravity(Gravity.CENTER_VERTICAL)
+        row.setPadding(dp(20), dp(10), dp(20), dp(10))
+        background = ripple(2)
+        if background is not None:
+            row.setBackground(background)
+
+        if icon:
+            image = lottie_icon(ctx, icon, 28, emoji, tint=red if danger else icon_color())
+        else:
+            image = TextView(ctx)
+            image.setText(emoji)
+            image.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 20)
+            image.setGravity(Gravity.CENTER)
+        row.addView(image, LinearLayout.LayoutParams(dp(28), dp(28)))
+
+        text = TextView(ctx)
+        text.setText(label)
+        text.setTextColor(red if danger else normal)
+        text.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16)
+        params = LinearLayout.LayoutParams(0, WRAP, 1.0)
+        params.leftMargin = dp(16)
+        row.addView(text, params)
+
+        def clicked(v, callback=callback):
+            dialog.dismiss()
+            callback()
+
+        row.setOnClickListener(OnClickListener(clicked))
+        box.addView(row, LinearLayout.LayoutParams(MATCH, WRAP))
+
+    dialog.set_view(box, WRAP)
+    dialog.show()
+
+
+def ask(ctx, title, hint, initial, multiline, ok_text, on_ok, show_markdown=False):
+    text_color = color("key_dialogTextBlack", "#000000")
+    gray = color("key_dialogTextGray2", "#8A8A8A")
+
+    field = EditText(ctx)
+    field.setHint(hint)
+    field.setText(initial)
+    style_field(field)
+    field.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16)
+    field.setPadding(dp(14), dp(10), dp(14), dp(10))
+    if multiline:
+        field.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES)
+        field.setMinLines(4)
+        field.setMaxLines(10)
+        field.setGravity(Gravity.TOP | Gravity.START)
+    else:
+        field.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES)
+        field.setSingleLine(True)
+    field.setSelection(field.getText().length())
+
+    box = LinearLayout(ctx)
+    box.setOrientation(LinearLayout.VERTICAL)
+    box.setPadding(dp(20), dp(4), dp(20), 0)
+    box.addView(field, LinearLayout.LayoutParams(MATCH, WRAP))
+
+    if show_markdown:
+        hint_view = TextView(ctx)
+        hint_view.setText(MARKDOWN_HINT)
+        hint_view.setTextColor(gray)
+        hint_view.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12)
+        params = LinearLayout.LayoutParams(MATCH, WRAP)
+        params.topMargin = dp(8)
+        box.addView(hint_view, params)
+
+    dialog = AlertDialogBuilder(ctx)
+    dialog.set_title(title)
+    dialog.set_view(box, WRAP)
+
+    def confirm(builder, which):
+        value = str(field.getText().toString()).strip()
+        builder.dismiss()
+        if value:
+            on_ok(value)
+
+    dialog.set_positive_button(ok_text, confirm)
+    dialog.set_negative_button("Отмена", lambda builder, which: builder.dismiss())
+    dialog.show()
+
+    def focus():
+        field.requestFocus()
+        AndroidUtilities.showKeyboard(field)
+
+    run_on_ui_thread(focus, 150)
+
+
+class TemplatesDialog:
+    def __init__(self, plugin, ctx, target):
+        self.plugin = plugin
+        self.ctx = ctx
+        self.target = target
+        self.folder_id = None
+        self.dialog = None
+        self.title = None
+        self.back = None
+        self.list = None
+        self.logo = None
+
+    def show(self):
+        ctx = self.ctx
+        header_height = dp(56)
+        list_height = max(dp(220), min(int(int(AndroidUtilities.displaySize.y) * 0.48), dp(420)))
+        icon_tint = color("key_dialogIcon", "#8A8A8A")
+
+        root = LinearLayout(ctx)
+        root.setOrientation(LinearLayout.VERTICAL)
+
+        header = LinearLayout(ctx)
+        header.setOrientation(LinearLayout.HORIZONTAL)
+        header.setGravity(Gravity.CENTER_VERTICAL)
+
+        self.back = make_icon(ctx, ["ic_ab_back"], icon_tint, "←")
+        self.back.setVisibility(View.GONE)
+        self.back.setOnClickListener(OnClickListener(lambda v: self.open_folder(None)))
+        header.addView(self.back, LinearLayout.LayoutParams(dp(48), dp(48)))
+
+        self.logo = lottie_icon(ctx, "001", 30, "📋")
+        logo_params = LinearLayout.LayoutParams(dp(30), dp(30))
+        logo_params.leftMargin = dp(20)
+        header.addView(self.logo, logo_params)
+
+        self.title = TextView(ctx)
+        self.title.setTextColor(color("key_dialogTextBlack", "#000000"))
+        self.title.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 19)
+        self.title.setTypeface(Typeface.DEFAULT_BOLD)
+        self.title.setSingleLine(True)
+        self.title.setEllipsize(TextUtils.TruncateAt.END)
+        header.addView(self.title, LinearLayout.LayoutParams(0, WRAP, 1.0))
+
+        dots = make_icon(ctx, ["ic_ab_other"], icon_tint, "⋮")
+        dots.setOnClickListener(OnClickListener(lambda v: self.show_menu()))
+        header.addView(dots, LinearLayout.LayoutParams(dp(48), dp(48)))
+
+        for button in (self.back, dots):
+            background = ripple(1)
+            if background is not None:
+                button.setBackground(background)
+
+        root.addView(header, LinearLayout.LayoutParams(MATCH, header_height))
+
+        line = View(ctx)
+        line.setBackgroundColor(color("key_divider", "#1F000000"))
+        root.addView(line, LinearLayout.LayoutParams(MATCH, 1))
+
+        scroll = ScrollView(ctx)
+        scroll.setVerticalScrollBarEnabled(False)
+        self.list = LinearLayout(ctx)
+        self.list.setOrientation(LinearLayout.VERTICAL)
+        scroll.addView(self.list, FrameLayout.LayoutParams(MATCH, WRAP))
+        root.addView(scroll, LinearLayout.LayoutParams(MATCH, list_height))
+
+        self.render()
+
+        self.dialog = AlertDialogBuilder(ctx)
+        self.dialog.set_view(root, header_height + 1 + list_height)
+        self.dialog.show()
+
+    def current_folder(self):
+        for item in self.plugin.items:
+            if item["id"] == self.folder_id and item["type"] == "folder":
+                return item
+        self.folder_id = None
+        return None
+
+    def current_items(self):
+        folder = self.current_folder()
+        return folder["items"] if folder else self.plugin.items
+
+    def open_folder(self, folder_id):
+        self.folder_id = folder_id
+        self.render()
+
+    def render(self):
+        folder = self.current_folder()
+        items = self.current_items()
+
+        if folder:
+            self.title.setText(folder["name"])
+            self.title.setPadding(dp(4), 0, dp(8), 0)
+            self.back.setVisibility(View.VISIBLE)
+            self.logo.setVisibility(View.GONE)
+        else:
+            self.title.setText("Заготовки")
+            self.title.setPadding(dp(12), 0, dp(8), 0)
+            self.back.setVisibility(View.GONE)
+            self.logo.setVisibility(View.VISIBLE)
+
+        self.list.removeAllViews()
+
+        if not items:
+            self.list.addView(self.empty_view(), LinearLayout.LayoutParams(MATCH, WRAP))
+            return
+
+        for i, item in enumerate(items):
+            row = self.folder_row(item) if item["type"] == "folder" else self.template_row(item)
+            self.list.addView(row, LinearLayout.LayoutParams(MATCH, WRAP))
+            if i < len(items) - 1:
+                line = View(self.ctx)
+                line.setBackgroundColor(alpha(color("key_divider", "#1F000000"), 90))
+                params = LinearLayout.LayoutParams(MATCH, 1)
+                params.leftMargin = dp(20)
+                self.list.addView(line, params)
+
+    def empty_view(self):
+        box = LinearLayout(self.ctx)
+        box.setOrientation(LinearLayout.VERTICAL)
+        box.setGravity(Gravity.CENTER)
+        box.setPadding(dp(32), dp(56), dp(32), dp(32))
+
+        icon = lottie_icon(self.ctx, "001", 96, "📋", loop=True)
+        box.addView(icon, LinearLayout.LayoutParams(dp(96), dp(96)))
+
+        text = TextView(self.ctx)
+        text.setText("Пока нет заготовок\nНажмите ⋮ сверху и выберите «Добавить заготовку»")
+        text.setTextColor(color("key_dialogTextGray2", "#8A8A8A"))
+        text.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14)
+        text.setGravity(Gravity.CENTER)
+        params = LinearLayout.LayoutParams(WRAP, WRAP)
+        params.topMargin = dp(12)
+        box.addView(text, params)
+        return box
+
+    def base_row(self):
+        row = LinearLayout(self.ctx)
+        row.setOrientation(LinearLayout.HORIZONTAL)
+        row.setGravity(Gravity.CENTER_VERTICAL)
+        row.setPadding(dp(20), dp(13), dp(16), dp(13))
+        background = ripple(2)
+        if background is not None:
+            row.setBackground(background)
+        return row
+
+    def template_row(self, item):
+        row = self.base_row()
+        media = self.plugin.item_media(item)
+        text_value = item.get("text", "") or ""
+
+        if media:
+            thumbs = LinearLayout(self.ctx)
+            thumbs.setOrientation(LinearLayout.HORIZONTAL)
+            for entry in media[:3]:
+                params = LinearLayout.LayoutParams(dp(46), dp(46))
+                params.rightMargin = dp(6)
+                thumbs.addView(thumb_view(self.ctx, entry, 46), params)
+            if len(media) > 3:
+                more = TextView(self.ctx)
+                more.setText("+%d" % (len(media) - 3))
+                more.setTextColor(field_text())
+                more.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13)
+                more.setGravity(Gravity.CENTER)
+                more.setBackground(rounded(alpha(accent_color(), 36), 8))
+                params = LinearLayout.LayoutParams(dp(46), dp(46))
+                params.rightMargin = dp(6)
+                thumbs.addView(more, params)
+            row.addView(thumbs, LinearLayout.LayoutParams(WRAP, WRAP))
+
+        text = TextView(self.ctx)
+        if text_value:
+            text.setText(text_value)
+        elif media:
+            names = [e.get("name", "") for e in media if e.get("type") in ("audio", "document")]
+            text.setText(names[0] + (" (+%d)" % (len(media) - 1) if len(media) > 1 else "") if names else media_summary(media))
+        text.setTextColor(color("key_dialogTextBlack", "#000000"))
+        text.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16)
+        text.setMaxLines(3)
+        text.setEllipsize(TextUtils.TruncateAt.END)
+        params = LinearLayout.LayoutParams(0, WRAP, 1.0)
+        if media:
+            params.leftMargin = dp(4)
+        row.addView(text, params)
+
+        row.setOnClickListener(OnClickListener(lambda v, item=item: self.send(item)))
+        row.setOnLongClickListener(OnLongClickListener(lambda v, item=item: self.item_menu(item)))
+        return row
+
+    def folder_row(self, item):
+        row = self.base_row()
+
+        icon = TextView(self.ctx)
+        icon.setText("📁")
+        icon.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 22)
+        row.addView(icon, LinearLayout.LayoutParams(WRAP, WRAP))
+
+        name = TextView(self.ctx)
+        name.setText(item["name"])
+        name.setTextColor(color("key_dialogTextBlack", "#000000"))
+        name.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16)
+        name.setTypeface(Typeface.DEFAULT_BOLD)
+        name.setSingleLine(True)
+        name.setEllipsize(TextUtils.TruncateAt.END)
+        params = LinearLayout.LayoutParams(0, WRAP, 1.0)
+        params.leftMargin = dp(14)
+        row.addView(name, params)
+
+        count = TextView(self.ctx)
+        count.setText(str(len(item["items"])))
+        count.setTextColor(color("key_dialogTextGray2", "#8A8A8A"))
+        count.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14)
+        row.addView(count, LinearLayout.LayoutParams(WRAP, WRAP))
+
+        row.setOnClickListener(OnClickListener(lambda v, item=item: self.open_folder(item["id"])))
+        row.setOnLongClickListener(OnLongClickListener(lambda v, item=item: self.item_menu(item)))
+        return row
+
+    def send(self, item):
+        self.dialog.dismiss()
+        self.plugin.send_template(item, self.target)
+
+    def show_menu(self):
+        rows = [
+            ("Добавить заготовку", "002", "➕", self.add_template, False),
+            ("Инструкция", "004", "📖", lambda: self.plugin.show_markdown_help(self.ctx), False),
+        ]
+        if not self.folder_id:
+            rows.append(("Создать папку", "folder", "📁", self.add_folder, False))
+        show_actions(self.ctx, rows)
+
+    def add_template(self):
+        self.plugin.show_template_editor(self.ctx, self.folder_id, None, self.render)
+
+    def add_folder(self):
+        def save(name):
+            self.plugin.add_folder(name)
+            self.render()
+
+        ask(self.ctx, "Новая папка", "Название папки", "", False, "Создать", save)
+
+    def item_menu(self, item):
+        is_folder = item["type"] == "folder"
+        rows = [("Переименовать" if is_folder else "Редактировать", "edit", "✏️", lambda: self.edit(item), False)]
+        if not is_folder and self.folder_id is None:
+            rows.append(("Добавить в папку", "002", "📂", lambda: self.choose_folder_for_item(item), False))
+        rows.append(("Удалить", "003", "🗑", lambda: self.remove(item), True))
+        show_actions(self.ctx, rows)
+        return True
+
+    def choose_folder_for_item(self, item):
+        folders = [x for x in self.plugin.items if x.get("type") == "folder"]
+        if not folders:
+            BulletinHelper.show_info("Сначала создайте папку")
+            return
+        labels = [folder.get("name", "Папка") for folder in folders]
+        picker = AlertDialogBuilder(self.ctx)
+
+        def picked(builder, index):
+            builder.dismiss()
+            if 0 <= int(index) < len(folders):
+                self.plugin.move_template_to_folder(item, folders[int(index)])
+                self.render()
+                BulletinHelper.show_info("Заготовка добавлена в папку")
+
+        picker.set_title("Добавить в папку")
+        picker.set_items(labels, picked)
+        picker.show()
+
+    def edit(self, item):
+        if item["type"] == "folder":
+            def save_name(name):
+                self.plugin.rename_folder(item, name)
+                self.render()
+
+            ask(self.ctx, "Переименовать папку", "Название папки", item["name"], False, "Сохранить", save_name)
+        else:
+            self.plugin.show_template_editor(self.ctx, self.folder_id, item, self.render)
+
+    def remove(self, item):
+        if item["type"] != "folder":
+            self.plugin.delete_item(item["id"])
+            self.render()
+            return
+
+        dialog = AlertDialogBuilder(self.ctx)
+        dialog.set_title("Удалить папку?")
+        dialog.set_message("Папка «%s» и все заготовки в ней (%d) будут удалены." % (item["name"], len(item["items"])))
+
+        def confirm(builder, which):
+            builder.dismiss()
+            self.plugin.delete_item(item["id"])
+            self.render()
+
+        dialog.set_positive_button("Удалить", confirm)
+        dialog.set_negative_button("Отмена", lambda builder, which: builder.dismiss())
+        dialog.show()
+        try:
+            dialog.make_button_red(AlertDialogBuilder.BUTTON_POSITIVE)
+        except Exception:
+            pass
+
+
+class ConstructorHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            self.plugin.hook_field_right(param.thisObject.getClass())
+        except Exception:
+            self.plugin.logger.exception("cannot hook updateFieldRight")
+        try:
+            self.plugin.inject(param.thisObject)
+        except Exception:
+            self.plugin.logger.exception("constructor hook failed")
+
+
+class FieldRightHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            if int(param.args[0]) == 1:
+                self.plugin.fix_margin(param.thisObject)
+        except Exception:
+            self.plugin.logger.exception("updateFieldRight hook failed")
+
+
+class ActivityResultHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            code = int(param.args[0])
+            self.plugin.seen_codes.append(code)
+            if code == PICKER_REQUEST_CODE:
+                self.plugin.handle_picker_result(param.args[1], param.args[2])
+        except Exception as error:
+            self.plugin.logger.exception("picker result hook failed")
+            BulletinHelper.show_error(("Ошибка результата: %s %s" % (type(error).__name__, error))[:160])
+
+
+class WorkpiecesUpPlugin(BasePlugin):
+    items = []
+
+    def on_plugin_load(self):
+        self.items = self.load_items()
+        self.pending_picker = None
+        self.editor = None
+        self.hooked_result_classes = set()
+        self.field_right_hooked = False
+        self.hook_log = []
+        self.seen_codes = []
+        try:
+            self.message_menu_id = self.add_menu_item(MenuItemData(
+                menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
+                text="Добавить в заготовки",
+                on_click=self.add_template_from_message,
+                icon="msg_quickreply",
+                priority=5,
+            ))
+        except Exception:
+            self.logger.exception("cannot register message context menu")
+
+        enter_view = find_class(ENTER_VIEW)
+        if not enter_view:
+            self.logger.error("ChatActivityEnterView not found")
+            return
+
+        self.hook_all_constructors(enter_view, ConstructorHook(self))
+
+        run_on_ui_thread(self.inject_current_chat)
+
+    def on_plugin_unload(self):
+        run_on_ui_thread(self.remove_from_current_chat)
+
+    def show_template_editor(self, ctx, folder_id, item, on_saved):
+        text_color = color("key_dialogTextBlack", "#000000")
+        gray = color("key_dialogTextGray2", "#8A8A8A")
+        blue = accent_color()
+
+        original = [dict(entry) for entry in self.item_media(item)]
+        media = [dict(entry) for entry in original]
+        self.editor = {"media": media}
+
+        box = LinearLayout(ctx)
+        box.setOrientation(LinearLayout.VERTICAL)
+        box.setPadding(dp(20), dp(4), dp(20), 0)
+
+        text_field = EditText(ctx)
+        text_field.setHint("Текст заготовки")
+        text_field.setText((item or {}).get("text", ""))
+        style_field(text_field)
+        text_field.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16)
+        text_field.setPadding(dp(14), dp(10), dp(14), dp(10))
+        text_field.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES)
+        text_field.setMinLines(4)
+        text_field.setMaxLines(9)
+        text_field.setGravity(Gravity.TOP | Gravity.START)
+        box.addView(text_field, LinearLayout.LayoutParams(MATCH, WRAP))
+
+        attachments = HorizontalScrollView(ctx)
+        attachments.setHorizontalScrollBarEnabled(False)
+        strip = LinearLayout(ctx)
+        strip.setOrientation(LinearLayout.HORIZONTAL)
+        attachments.addView(strip, FrameLayout.LayoutParams(WRAP, WRAP))
+        attach_params = LinearLayout.LayoutParams(MATCH, WRAP)
+        attach_params.topMargin = dp(8)
+        box.addView(attachments, attach_params)
+
+        def refresh():
+            strip.removeAllViews()
+            attachments.setVisibility(View.VISIBLE if media else View.GONE)
+            for entry in list(media):
+                def drop(entry=entry):
+                    if entry in media:
+                        media.remove(entry)
+                    refresh()
+
+                params = LinearLayout.LayoutParams(dp(76), dp(76))
+                params.rightMargin = dp(8)
+                strip.addView(thumb_view(ctx, entry, 76, on_remove=drop, show_name=True), params)
+
+        self.editor["refresh"] = refresh
+        refresh()
+
+        buttons = [("📎 Файл", "file"), ("🖼 Фото", "photo"), ("🎬 Видео", "video"), ("🎵 Аудио", "audio")]
+        for start in (0, 2):
+            line = LinearLayout(ctx)
+            line.setOrientation(LinearLayout.HORIZONTAL)
+            for label, kind in buttons[start:start + 2]:
+                button = TextView(ctx)
+                button.setText(label)
+                button.setTextColor(blue)
+                button.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14)
+                button.setGravity(Gravity.CENTER)
+                button.setPadding(dp(8), dp(10), dp(8), dp(10))
+                button.setBackground(rounded(alpha(blue, 32), 10))
+                button.setOnClickListener(OnClickListener(lambda v, kind=kind: self.open_file_picker(ctx, kind)))
+                params = LinearLayout.LayoutParams(0, WRAP, 1.0)
+                params.setMargins(dp(2), dp(6), dp(2), 0)
+                line.addView(button, params)
+            box.addView(line, LinearLayout.LayoutParams(MATCH, WRAP))
+
+        hint = TextView(ctx)
+        hint.setText("Поддерживается Markdown и HTML. Premium Emoji: <tg-emoji emoji-id='id'>символ</tg-emoji>. Нажмите ниже, чтобы открыть инструкцию.")
+        hint.setTextColor(gray)
+        hint.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12)
+        params = LinearLayout.LayoutParams(MATCH, WRAP)
+        params.topMargin = dp(10)
+        box.addView(hint, params)
+
+        markdown_help = LinearLayout(ctx)
+        markdown_help.setOrientation(LinearLayout.HORIZONTAL)
+        markdown_help.setGravity(Gravity.CENTER_VERTICAL)
+        markdown_help.setPadding(0, dp(8), 0, dp(4))
+        help_icon = lottie_icon(ctx, "004", 24, "📖", tint=blue)
+        markdown_help.addView(help_icon, LinearLayout.LayoutParams(dp(24), dp(24)))
+        markdown_label = TextView(ctx)
+        markdown_label.setText("Открыть инструкцию по Markdown")
+        markdown_label.setTextColor(blue)
+        markdown_label.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13)
+        label_margin = LinearLayout.LayoutParams(WRAP, WRAP)
+        label_margin.leftMargin = dp(8)
+        markdown_help.addView(markdown_label, label_margin)
+        markdown_help.setOnClickListener(OnClickListener(lambda v: self.show_markdown_help(ctx)))
+        box.addView(markdown_help, LinearLayout.LayoutParams(MATCH, WRAP))
+
+        scroll = ScrollView(ctx)
+        scroll.setVerticalScrollBarEnabled(False)
+        scroll.addView(box, FrameLayout.LayoutParams(MATCH, WRAP))
+
+        def discard():
+            kept = set(entry["path"] for entry in original)
+            self.drop_files([entry for entry in media if entry["path"] not in kept])
+
+        dialog = AlertDialogBuilder(ctx)
+        dialog.set_title("Редактировать заготовку" if item else "Новая заготовка")
+        dialog.set_view(scroll, WRAP)
+
+        def confirm(builder, which):
+            value = str(text_field.getText().toString()).strip()
+            builder.dismiss()
+            self.editor = None
+            if not value and not media:
+                discard()
+                return
+            still_used = set(entry["path"] for entry in media)
+            self.drop_files([entry for entry in original if entry["path"] not in still_used])
+            if item:
+                item["text"] = value
+                item["media"] = media
+                for key in ("media_path", "media_type", "media_mime", "media_name"):
+                    item.pop(key, None)
+                self.save_items()
+            else:
+                self.add_template(folder_id, value, media)
+            on_saved()
+
+        def cancel(builder, which):
+            builder.dismiss()
+            self.editor = None
+            discard()
+
+        dialog.set_positive_button("Сохранить" if item else "Добавить", confirm)
+        dialog.set_negative_button("Отмена", cancel)
+        dialog.show()
+
+    def show_markdown_help(self, ctx):
+        message = ("WORKPIECES UP — ИНСТРУКЦИЯ\n\n"
+                   "ЗАГОТОВКИ\n"
+                   "1. Нажмите на кнопку Workpieces Up возле поля ввода сообщения.\n"
+                   "2. Нажмите ⋮ и выберите «Добавить заготовку».\n"
+                   "3. Введите текст и при необходимости прикрепите файл.\n"
+                   "4. Нажмите «Добавить». Чтобы отправить заготовку, выберите её в списке.\n"
+                   "5. Удерживайте заготовку, чтобы открыть действия редактирования и удаления.\n\n"
+                   "ВЛОЖЕНИЯ\n"
+                   "В редакторе есть кнопки «Файл», «Фото», «Видео» и «Аудио». В системном окне можно отметить сразу несколько файлов, а кнопки можно нажимать повторно, чтобы добавить ещё. "
+                   "Каждое вложение убирается крестиком. Фото отправляется как фото, видео как видео, аудио как аудио, «Файл» как документ без сжатия. "
+                   "Если вложений несколько, они уходят по очереди, а текст заготовки становится подписью к первому. Файлы копируются в хранилище плагина на устройстве.\n\n"
+                   "СОХРАНИТЬ СООБЩЕНИЕ ИЗ ЧАТА\n"
+                   "Нажмите или удерживайте сообщение в чате, канале или личной переписке и выберите «Добавить в заготовки», "
+                   "если этот пункт доступен в меню клиента. Текст и доступный локальный медиафайл будут сохранены. "
+                   "Если Telegram ещё не загрузил медиа на устройство, сначала загрузите его или добавьте файл через галерею.\n\n"
+                   "ФОРМАТИРОВАНИЕ MARKDOWN\n"
+                   "*Жирный текст*\n"
+                   "_Курсив_\n"
+                   "__Подчёркнутый текст__\n"
+                   "~Зачёркнутый текст~\n"
+                   "||Спойлер||\n"
+                   "`Моноширинный текст`\n"
+                   "[Название ссылки](https://example.com)\n"
+                   "> Цитата\n"
+                   "Каждый перенос строки в редакторе сохраняется. Для списков используйте • или — в начале строки.\n\n"
+                   "ПРЕМИУМ-ЭМОДЗИ TELEGRAM\n"
+                   "Используйте формат <tg-emoji emoji-id='id'>символ</tg-emoji>. Вместо id укажите ID премиум-эмодзи, вместо символ — его обычный символ.\n"
+                   "Полную HTML-вставку можно получить в боте @GOS_EmojiIDBot: отправьте боту премиум-эмодзи, нажмите «HTML вставки в тексте» и скопируйте полученный код в заготовку.\n"
+                   "Также принимается формат <emoji id=\"ID\">символ</emoji> и ![символ](tg://emoji?id=ID). Telegram проверяет право отправки на своей стороне.\n\n"
+                   "ПРИМЕЧАНИЯ\n"
+                   "Заготовки и скопированные вложения хранятся локально на устройстве и не синхронизируются между устройствами. "
+                   "Удаление данных приложения может удалить локальные копии медиа. Для отправки медиа Telegram может использовать своё обычное сетевое соединение.")
+        dialog = AlertDialogBuilder(ctx)
+        dialog.set_title("Инструкция — Workpieces Up")
+        dialog.set_message(message)
+        dialog.set_positive_button("Понятно", lambda builder, which: builder.dismiss())
+        dialog.show()
+
+    def find_method(self, cls, name, count):
+        for method in cls.getDeclaredMethods():
+            if str(method.getName()) == name and len(method.getParameterTypes()) == count:
+                return method
+        return None
+
+    def hook_result_chain(self, cls):
+        while cls is not None:
+            name = str(cls.getName())
+            if name.startswith("android.") or name.startswith("java."):
+                break
+            if name not in self.hooked_result_classes:
+                try:
+                    method = self.find_method(cls, "onActivityResult", 3)
+                    if method is None:
+                        self.hook_log.append("нет метода: " + name)
+                    else:
+                        method.setAccessible(True)
+                        self.hook_method(method, ActivityResultHook(self))
+                        self.hooked_result_classes.add(name)
+                        self.hook_log.append("hook ok: " + name)
+                except Exception as error:
+                    self.hook_log.append("hook skip: %s (%s %s)" % (name, type(error).__name__, error))
+            cls = cls.getSuperclass()
+
+    def hook_field_right(self, cls):
+        if self.field_right_hooked:
+            return
+        while cls is not None:
+            name = str(cls.getName())
+            if name.startswith("android.") or name.startswith("java."):
+                return
+            method = self.find_method(cls, "updateFieldRight", 1)
+            if method is not None:
+                method.setAccessible(True)
+                self.hook_method(method, FieldRightHook(self))
+                self.field_right_hooked = True
+                return
+            cls = cls.getSuperclass()
+
+    def show_picker_report(self, title):
+        text = "Запрос: %d\nХуки:\n%s\nПолучено onActivityResult с кодами: %s" % (
+            PICKER_REQUEST_CODE,
+            "\n".join(self.hook_log) or "нет",
+            ", ".join(str(code) for code in self.seen_codes[-10:]) or "ни одного вызова",
+        )
+        fragment = get_last_fragment()
+        activity = fragment.getParentActivity() if fragment is not None else None
+        if activity is None:
+            BulletinHelper.show_error(title)
+            return
+        dialog = AlertDialogBuilder(activity)
+        dialog.set_title(title)
+        dialog.set_message(text)
+        dialog.set_positive_button("OK", lambda builder, which: builder.dismiss())
+        dialog.show()
+
+    def on_app_event(self, event_type):
+        if event_type != AppEvent.RESUME:
+            return
+        if getattr(self, "pending_picker", None) is None:
+            return
+
+        def check():
+            if self.pending_picker is not None:
+                self.pending_picker = None
+                self.show_picker_report("Результат выбора файла не дошёл до плагина")
+
+        run_on_ui_thread(check, 800)
+
+    def open_file_picker(self, ctx, kind):
+        try:
+            activity = ctx
+            if not hasattr(activity, "startActivityForResult"):
+                activity = get_last_fragment().getParentActivity()
+            self.seen_codes = []
+            self.hook_result_chain(activity.getClass())
+            intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
+            intent.addCategory(Intent.CATEGORY_OPENABLE)
+            intent.setType(PICKER_TYPES.get(kind, "*/*"))
+            intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, True)
+            self.pending_picker = {"activity": activity, "kind": kind}
+            activity.startActivityForResult(intent, PICKER_REQUEST_CODE)
+        except Exception as error:
+            self.pending_picker = None
+            self.logger.exception("cannot open file picker")
+            BulletinHelper.show_error(("Не удалось открыть выбор файла: %s %s" % (type(error).__name__, error))[:160])
+
+    def handle_picker_result(self, result_code, data):
+        pending = self.pending_picker
+        self.pending_picker = None
+        if pending is None:
+            BulletinHelper.show_error("Результат выбора пришёл, но запрос уже сброшен")
+            return
+        try:
+            from android.app import Activity
+            if int(result_code) != int(Activity.RESULT_OK):
+                return
+            if data is None:
+                BulletinHelper.show_error("Выбор файла: пустой ответ (data=null)")
+                return
+            uris = []
+            clip = data.getClipData()
+            if clip is not None:
+                for index in range(int(clip.getItemCount())):
+                    uris.append(clip.getItemAt(index).getUri())
+            elif data.getData() is not None:
+                uris.append(data.getData())
+            if not uris:
+                BulletinHelper.show_error("Выбор файла: нет uri в ответе")
+                return
+            activity = pending["activity"]
+            kind = pending["kind"]
+            run_on_queue(lambda: self.process_picked(activity, uris, kind))
+        except Exception as error:
+            self.logger.exception("picker result handling failed")
+            BulletinHelper.show_error(("Ошибка выбора файла: %s %s" % (type(error).__name__, error))[:160])
+
+    def process_picked(self, activity, uris, kind):
+        entries = []
+        errors = []
+        for uri in uris:
+            try:
+                entries.append(self.copy_picked_file(activity, uri, kind))
+            except Exception as error:
+                self.logger.exception("cannot copy picked file")
+                errors.append(("Не удалось сохранить файл: %s %s" % (type(error).__name__, error))[:160])
+
+        def done():
+            editor = self.editor
+            if editor is None:
+                self.drop_files(entries)
+                return
+            editor["media"].extend(entries)
+            editor["refresh"]()
+            if errors:
+                BulletinHelper.show_error(errors[0])
+            elif entries:
+                BulletinHelper.show_info("Прикреплено: %d" % len(entries))
+
+        run_on_ui_thread(done)
+
+    def entry_type(self, kind, mime):
+        if kind == "photo" and mime.startswith("image/"):
+            return "photo"
+        if kind == "video" and mime.startswith("video/"):
+            return "video"
+        if kind == "audio" and mime.startswith("audio/"):
+            return "audio"
+        return "document"
+
+    def media_directory(self, activity):
+        directory = os.path.join(str(activity.getFilesDir().getAbsolutePath()), "workpieces_up", "media")
+        os.makedirs(directory, exist_ok=True)
+        return directory
+
+    def copy_stream(self, source, output):
+        buffer = jarray(jbyte)(262144)
+        while True:
+            count = source.read(buffer)
+            if count < 0:
+                break
+            output.write(buffer, 0, count)
+
+    def copy_picked_file(self, activity, uri, kind):
+        destination = None
+        try:
+            from android.provider import OpenableColumns
+            from java.io import FileOutputStream
+
+            resolver = activity.getContentResolver()
+            mime = str(resolver.getType(uri) or "application/octet-stream")
+
+            name = str(uri.getLastPathSegment() or "file")
+            try:
+                cursor = resolver.query(uri, None, None, None, None)
+                try:
+                    if cursor is not None and cursor.moveToFirst():
+                        index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                        if index >= 0:
+                            name = str(cursor.getString(index) or name)
+                finally:
+                    if cursor is not None:
+                        cursor.close()
+            except Exception:
+                self.logger.exception("cannot read file name")
+
+            name = os.path.basename(name).replace("\\", "_").replace("/", "_")
+            ext = os.path.splitext(name)[1]
+            if not ext:
+                import mimetypes
+                ext = mimetypes.guess_extension(mime) or ".bin"
+
+            destination = os.path.join(self.media_directory(activity), uuid.uuid4().hex + ext)
+            source = resolver.openInputStream(uri)
+            if source is None:
+                raise RuntimeError("не удалось открыть файл")
+            output = FileOutputStream(destination)
+            try:
+                self.copy_stream(source, output)
+            finally:
+                source.close()
+                output.close()
+
+            if os.path.getsize(destination) <= 0:
+                raise RuntimeError("файл пустой")
+        except Exception:
+            if destination and os.path.isfile(destination):
+                os.remove(destination)
+            raise
+
+        return {"path": destination, "type": self.entry_type(kind, mime), "mime": mime, "name": name}
+
+    def find_message_file(self, message, account):
+        paths = []
+        try:
+            found = FileLoader.getInstance(account).getPathToMessage(message.messageOwner)
+            if found is not None:
+                paths.append(str(found.getAbsolutePath()))
+        except Exception:
+            pass
+        try:
+            paths.append(str(message.messageOwner.attachPath or ""))
+        except Exception:
+            pass
+        for path in paths:
+            if path and os.path.isfile(path) and os.path.getsize(path) > 0:
+                return path
+        return ""
+
+    def add_template_from_message(self, context):
+        try:
+            message = context.get("message")
+            if message is None:
+                BulletinHelper.show_error("Не удалось получить сообщение")
+                return
+
+            account = context.get("account")
+            account = int(account) if account is not None else int(UserConfig.selectedAccount)
+
+            text = str(message.messageOwner.message or "")
+            kind = "document"
+            has_media = False
+            try:
+                if message.isPhoto():
+                    kind, has_media = "photo", True
+                elif message.isVideo() or message.isGif():
+                    kind, has_media = "video", True
+                elif message.isDocument():
+                    has_media = True
+            except Exception:
+                pass
+
+            copied = ""
+            name = ""
+            if has_media:
+                source = self.find_message_file(message, account)
+                if source:
+                    activity = context.get("context")
+                    if activity is None or not hasattr(activity, "getFilesDir"):
+                        activity = get_last_fragment().getParentActivity()
+                    name = os.path.basename(source)
+                    ext = os.path.splitext(source)[1] or (".mp4" if kind == "video" else ".jpg" if kind == "photo" else ".bin")
+                    copied = os.path.join(self.media_directory(activity), uuid.uuid4().hex + ext)
+                    shutil.copyfile(source, copied)
+                else:
+                    BulletinHelper.show_info("Медиа не загружено, сохранён только текст")
+
+            if not text and not copied:
+                BulletinHelper.show_error("В сообщении нет текста и загруженного файла")
+                return
+
+            media = [{"path": copied, "type": kind, "mime": "", "name": name}] if copied else []
+            self.add_template(None, text, media)
+            BulletinHelper.show_info("Добавлено в заготовки")
+        except Exception as error:
+            self.logger.exception("cannot save message as template")
+            BulletinHelper.show_error(("Не удалось добавить в заготовки: %s" % error)[:160])
+
+    def load_items(self):
+        raw = self.get_setting(STORAGE_KEY, "")
+        if not raw:
+            return []
+        try:
+            data = json.loads(raw)
+        except Exception:
+            self.logger.exception("broken storage")
+            return []
+        return data if isinstance(data, list) else []
+
+    def save_items(self):
+        self.set_setting(STORAGE_KEY, json.dumps(self.items, ensure_ascii=False))
+
+    def container(self, folder_id):
+        for item in self.items:
+            if item["id"] == folder_id and item["type"] == "folder":
+                return item["items"]
+        return self.items
+
+    def item_media(self, item):
+        if not item:
+            return []
+        if isinstance(item.get("media"), list):
+            return item["media"]
+        path = item.get("media_path")
+        if path:
+            return [{
+                "path": path,
+                "type": item.get("media_type") or "document",
+                "mime": item.get("media_mime", ""),
+                "name": item.get("media_name") or os.path.basename(path),
+            }]
+        return []
+
+    def drop_files(self, entries):
+        for entry in entries:
+            try:
+                path = entry.get("path", "")
+                if path and os.path.isfile(path):
+                    os.remove(path)
+            except Exception:
+                self.logger.exception("cannot delete media file")
+
+    def row_label(self, item):
+        text = item.get("text", "") or ""
+        media = self.item_media(item)
+        if not media:
+            return text
+        if not text:
+            label = MEDIA_ICONS.get(media[0].get("type"), "📎") + " " + media[0].get("name", "файл")
+            return label + (" (+%d)" % (len(media) - 1) if len(media) > 1 else "")
+        return text + "  📎%d" % len(media)
+
+    def add_template(self, folder_id, text, media=None):
+        self.container(folder_id).append({"id": uuid.uuid4().hex[:10], "type": "template", "text": text, "media": media or []})
+        self.save_items()
+
+    def move_template_to_folder(self, item, folder):
+        for index, existing in enumerate(self.items):
+            if existing.get("id") == item.get("id") and existing.get("type") == "template":
+                moved = self.items.pop(index)
+                folder.setdefault("items", []).append(moved)
+                self.save_items()
+                return True
+        return False
+
+    def add_folder(self, name):
+        self.items.append({"id": uuid.uuid4().hex[:10], "type": "folder", "name": name[:40], "items": []})
+        self.save_items()
+
+    def edit_template(self, item, text):
+        item["text"] = text
+        self.save_items()
+
+    def rename_folder(self, item, name):
+        item["name"] = name[:40]
+        self.save_items()
+
+    def delete_item(self, item_id):
+        removed = None
+        for i, item in enumerate(self.items):
+            if item["id"] == item_id:
+                removed = self.items.pop(i)
+                break
+            if item["type"] == "folder":
+                for j, sub in enumerate(item["items"]):
+                    if sub["id"] == item_id:
+                        removed = item["items"].pop(j)
+                        break
+                if removed is not None:
+                    break
+        if removed is not None:
+            templates = removed.get("items", []) if removed["type"] == "folder" else [removed]
+            for template in templates:
+                self.drop_files(self.item_media(template))
+        self.save_items()
+
+    def prepare_text(self, text):
+        import re
+        tg_emoji = re.compile(r"<tg-emoji\s+emoji-id\s*=\s*(['\"])(\d+)\1\s*>(.*?)</tg-emoji>", re.IGNORECASE | re.DOTALL)
+        has_markdown = any(token in text for token in ("*", "_", "||", "[", ">", "~", "`"))
+        if tg_emoji.search(text):
+            if has_markdown:
+                return tg_emoji.sub(lambda m: "![%s](tg://emoji?id=%s)" % (m.group(3), m.group(2)), text), "Markdown"
+            return tg_emoji.sub(lambda m: '<emoji id="%s">%s</emoji>' % (m.group(2), m.group(3)), text), "HTML"
+        return text, ("Markdown" if has_markdown else None)
+
+    def send_template(self, item, target):
+        text, mode = self.prepare_text(item.get("text", "") or "")
+        self.send_content(text, mode, self.item_media(item), target)
+
+    def parse_caption(self, text, mode):
+        """Возвращает (текст, entities) или None, если разметку не удалось разобрать."""
+        if not mode:
+            return text, None
+        if mode != "Markdown" or "tg://emoji" in text:
+            return None
+        from markdown_utils import parse_markdown
+
+        parsed = parse_markdown(text)
+        if isinstance(parsed, tuple):
+            plain, entities = parsed[0], parsed[1]
+        else:
+            plain, entities = parsed.text, parsed.entities
+        return str(plain), entities
+
+    def send_album(self, group, text, mode, target, kind):
+        """Отправляет группу файлов одним сообщением-альбомом. False — если не получилось."""
+        from java.util import ArrayList
+
+        caption = parse = None
+        if text:
+            parse = self.parse_caption(text, mode)
+            if parse is None or len(parse[0]) > 1024:
+                return False
+            caption = parse[0]
+
+        from java import jclass
+        from org.telegram.messenger import AccountInstance
+
+        helper = find_lottie_class(None, "org.telegram.messenger.SendMessagesHelper")
+        if helper is None:
+            return False
+        info_class = jclass("org.telegram.messenger.SendMessagesHelper$SendingMediaInfo")
+
+        items = ArrayList()
+        for index, entry in enumerate(group):
+            info = info_class()
+            info.path = entry["path"]
+            if entry.get("type") == "video":
+                info.isVideo = True
+            if index == 0 and caption:
+                info.caption = caption
+                if parse[1] is not None:
+                    entities = parse[1]
+                    if not hasattr(entities, "add"):
+                        converted = ArrayList()
+                        for one in entities:
+                            converted.add(one)
+                        entities = converted
+                    info.entities = entities
+            items.add(info)
+
+        method = None
+        for candidate in helper.getDeclaredMethods():
+            if str(candidate.getName()) != "prepareSendingMedia":
+                continue
+            names = [str(t.getName()) for t in candidate.getParameterTypes()]
+            if "java.util.ArrayList" in names and "org.telegram.messenger.AccountInstance" in names:
+                if method is None or len(names) > len(method.getParameterTypes()):
+                    method = candidate
+        if method is None:
+            return False
+
+        account = AccountInstance.getInstance(int(target["account"]))
+        longs = 0
+        booleans = 0
+        args = []
+        for t in method.getParameterTypes():
+            name = str(t.getName())
+            if name == "org.telegram.messenger.AccountInstance":
+                args.append(account)
+            elif name == "java.util.ArrayList":
+                args.append(items)
+            elif name == "long":
+                args.append(int(target["dialog_id"]) if longs == 0 else 0)
+                longs += 1
+            elif name == "int":
+                args.append(jint(0))
+            elif name == "boolean":
+                # forceDocument, groupMedia, notify, остальные выключены
+                args.append(True if (booleans == 0 and kind == "document") or booleans in (1, 2) else False)
+                booleans += 1
+            else:
+                args.append(None)
+        method.setAccessible(True)
+        method.invoke(None, *args)
+        return True
+
+    def send_content(self, text, mode, media, target):
+        options = {"account": target["account"]}
+        if target["thread_id"]:
+            options["replyToMsg"] = target["thread_id"]
+        peer = target["dialog_id"]
+        senders = {"photo": send_photo, "video": send_video, "audio": send_audio}
+        try:
+            if not media:
+                send_text(peer, text, parse_mode=mode, **options)
+                return
+
+            valid = []
+            for entry in media:
+                if os.path.isfile(entry.get("path", "")):
+                    valid.append(entry)
+                else:
+                    BulletinHelper.show_error("Файл «%s» не найден, добавьте его заново" % entry.get("name", ""))
+            if not valid:
+                if text:
+                    send_text(peer, text, parse_mode=mode, **options)
+                return
+
+            groups = {}
+            for entry in valid:
+                kind = "visual" if entry.get("type") in ("photo", "video") else ("audio" if entry.get("type") == "audio" else "document")
+                groups.setdefault(kind, []).append(entry)
+
+            first = True
+            for kind in ("visual", "audio", "document"):
+                group = groups.get(kind)
+                if not group:
+                    continue
+                caption = text if first else ""
+                first = False
+                if len(group) > 1 and not target["thread_id"]:
+                    try:
+                        if self.send_album(group, caption, mode, target, kind):
+                            continue
+                    except Exception:
+                        self.logger.exception("album send failed, sending one by one")
+                for index, entry in enumerate(group):
+                    kwargs = dict(options)
+                    kwargs["caption"] = caption if index == 0 else ""
+                    if kwargs["caption"] and mode:
+                        kwargs["parse_mode"] = mode
+                    senders.get(entry.get("type"), send_document)(peer, entry["path"], **kwargs)
+        except Exception as error:
+            self.logger.exception("template send failed")
+            BulletinHelper.show_error(("Не удалось отправить заготовку: %s %s" % (type(error).__name__, error))[:160])
+
+    def find_button(self, layout):
+        for i in range(layout.getChildCount()):
+            child = layout.getChildAt(i)
+            if child is not None and child.getTag() == BUTTON_TAG:
+                return child
+        return None
+
+    def inject(self, view, attempt=0):
+        if get_private_field(view, "parentFragment") is None:
+            return
+
+        layout = get_private_field(view, "attachLayout")
+        if layout is None:
+            if attempt < 6:
+                run_on_ui_thread(lambda: self.inject(view, attempt + 1), 400)
+            return
+
+        if self.find_button(layout) is not None:
+            return
+
+        ctx = view.getContext()
+        button = self.make_chat_button(ctx)
+        button.setTag(BUTTON_TAG)
+        background = ripple(1)
+        if background is not None:
+            button.setBackground(background)
+        ref = WeakReference(view)
+        button.setOnClickListener(OnClickListener(lambda v, ref=ref: self.on_button_click(v, ref.get())))
+        layout.addView(button, 0, LinearLayout.LayoutParams(dp(48), dp(48)))
+        self.fix_margin(view)
+
+    def make_chat_button(self, ctx):
+        tint = light_color(["key_chat_messagePanelIcons", "key_dialogIcon"], "#3390EC", 0.12)
+        button = lottie_icon(ctx, "001", 28, "📋", tint=tint)
+        if isinstance(button, TextView):
+            return make_icon(ctx, BUTTON_ICONS, tint, "📋")
+        try:
+            button.setScaleType(ImageView.ScaleType.FIT_CENTER)
+        except Exception:
+            pass
+        button.setPadding(dp(10), dp(10), dp(10), dp(10))
+        return button
+
+    def fix_margin(self, view):
+        layout = get_private_field(view, "attachLayout")
+        if layout is None or self.find_button(layout) is None:
+            return
+        if get_private_field(view, "editingMessageObject") is not None:
+            return
+        field = get_private_field(view, "messageEditText")
+        if field is None:
+            return
+        params = field.getLayoutParams()
+        if params is not None and params.rightMargin >= dp(50):
+            params.rightMargin = params.rightMargin + dp(48)
+            field.setLayoutParams(params)
+
+    def current_enter_view(self):
+        fragment = get_last_fragment()
+        if fragment is None or str(fragment.getClass().getName()) != "org.telegram.ui.ChatActivity":
+            return None
+        return get_private_field(fragment, "chatActivityEnterView")
+
+    def inject_current_chat(self):
+        try:
+            view = self.current_enter_view()
+            if view is not None:
+                self.hook_field_right(view.getClass())
+                self.inject(view)
+        except Exception:
+            self.logger.exception("inject into open chat failed")
+
+    def remove_from_current_chat(self):
+        try:
+            view = self.current_enter_view()
+            layout = get_private_field(view, "attachLayout") if view is not None else None
+            button = self.find_button(layout) if layout is not None else None
+            if button is None:
+                return
+            layout.removeView(button)
+            field = get_private_field(view, "messageEditText")
+            params = field.getLayoutParams() if field is not None else None
+            if params is not None and params.rightMargin >= dp(98):
+                params.rightMargin = params.rightMargin - dp(48)
+                field.setLayoutParams(params)
+        except Exception:
+            self.logger.exception("cleanup failed")
+
+    def chat_fragment(self, button):
+        parent = button.getParent()
+        for _ in range(12):
+            if parent is None:
+                break
+            if str(parent.getClass().getName()) == ENTER_VIEW:
+                fragment = get_private_field(parent, "parentFragment")
+                if fragment is not None:
+                    return fragment
+                break
+            parent = parent.getParent()
+        return get_last_fragment()
+
+    def find_context(self, fragment, button):
+        sources = [
+            lambda: fragment.getParentActivity(),
+            lambda: get_last_fragment().getParentActivity(),
+            lambda: button.getContext(),
+        ]
+        for source in sources:
+            try:
+                ctx = source()
+            except Exception:
+                continue
+            if ctx is not None:
+                return ctx
+        return None
+
+    def on_button_click(self, button, view=None):
+        step = "поиск чата"
+        try:
+            replay(button)
+            fragment = get_private_field(view, "parentFragment") if view is not None else None
+            if fragment is None:
+                fragment = self.chat_fragment(button)
+            if fragment is None or not hasattr(fragment, "getDialogId"):
+                raise RuntimeError("чат не найден")
+
+            step = "контекст"
+            ctx = self.find_context(fragment, button)
+            if ctx is None:
+                raise RuntimeError("нет activity")
+
+            step = "данные чата"
+            thread_id = 0
+            for name in ("getTopicId", "getThreadMessageId"):
+                try:
+                    value = int(getattr(fragment, name)())
+                except Exception:
+                    continue
+                if value > 0:
+                    thread_id = value
+                    break
+
+            target = {
+                "dialog_id": int(fragment.getDialogId()),
+                "account": int(fragment.getCurrentAccount()),
+                "thread_id": thread_id,
+            }
+
+            step = "окно"
+            TemplatesDialog(self, ctx, target).show()
+        except Exception as error:
+            self.logger.exception("cannot open templates, step: %s", step)
+            BulletinHelper.show_error(("Заготовки, %s: %s %s" % (step, type(error).__name__, error))[:160])
+
+
+ICON_DATA = {
+    "001": (
+        "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"
+        "d5QBKpiIZLOQS+knA7ZuOpC1mGF2rhOZIL2A+9YFstZp1Jl+MmBd7ALZrlbGTwao1iKSvZSnSMUNtoo4kvUuKYuLicrCSq0jWZ+AuupPBmySGc"
+        "j6cKcdm8iAbTAeyDpvldx+MmDbjQeyyZZ2RCkDVL8Rybra0JHuQDm5Py2E3lx1BV101MkDVmodyBofVLKc4AErtf6Q/wek1tTD7vXz3AmZGjnQ"
+        "anUWtLG2E1Vcnwo0AXKixpsdkxjkRwDW8yucvRdUau1E069lqNbaid5ZA1ov6kT9aWuGiq2dqHNFwew4v2ytS3u1ZOrYFMWJul5kjC1Rf9aJ/L"
+        "gR3aht1U+lp0dg+6NgNCCWeDiRJcvtGshEQ3ms5KY2xgWZWDiRdeg7JVzQ80gnMp6c3zo0eXAkn4qXq2VsuuBI5lMNY4MmCI5UzUKq4HaxhrS2"
+        "ragOD49H6VP8xcUq0KjfiFq5g1rKLcyf77Wcej5jXa2NyPQbLrZ2JM8M5DuADd0dyZNa3QkzNlh3JM/J/WoLaz7jSO1EdE9s/aMjdUWsC2trrc"
+        "h/U2w9/lJsnRatLL9EK+/TIowqsW/aHa6oIkILrg6yBHG0RUY6hgLzhbRgLpJNNjs6feo9caUCTWsOtAmD752a0NsApbT90QV/yLIxsEOduhPI"
+        "2q6OKX1xpfWBFmn3oGdsvzqvienK6krrAy3i9bHvnyUaDYyV4GPsF9Gyj9Sl7XCbV8Fc0PUmB1q2yfYN1KV3dMdsXbne5EDLzE7KyMFNhzvI08"
+        "ftZyNaspPJne6oDzhINVDdfjaiZVe1X6Q/28FixZ6mHWTZMqZ+zPtTr3YtzJrsUpMDbSKFQuc2d90RB9Tk+kTLBfMOWys7+VeMRfJjlhTR8gtS"
+        "82/pVHBjjAtdZ3Kg5R5dpFX8ZdoKHVC59YmWp5BKZ6j4ad/BDSq4PtEyz7SdmrVf3hN6wuQFbnN9oGUmXVdL+9WWroZpPe021wdalHRpP5xif3"
+        "vngbWHimiJYferOXO9FeiMY7o3ekTLer+uTrUle0KfGL++5ScBEW2CTyktAW18uitVAIuetVDfnh8Z7YNaWbjq+mSbXrf1hSzLcdn1yTZNcstD"
+        "K+awpe4nW3TX7cqlsqXouhtYdx3Zoi0no1a6le4rdazF9ckWLRcFOPR4tqt0rMX1ybYuKGzSTsVQoDzWzxwOtjV6mUVsTBdImPzu9PJlS50HWa"
+        "aTmq/RN4A1BjjYXMhC3YnJs4j2zhNUe32g/yu9ngYFOwkWmLr0+kDrhiIVDeREHTYmdO/sQPP15p56qDhp/7yY+dtl1wdae63NSeVCOwkHbVy3"
+        "p6fbF83Xo+ifwnFUzajv5UWy1T1lqjIZff+2WL31ybbCp8INihbMZ9CrDg+2zGtVZJedPeGxbmsHW+ZukddRVUQbUMH1gZbVaa/LlDJS7Ija4f"
+        "TVKbLl4LVfN2+lUOMurPQgsv+kuN5ByWztJ8NLhLTvexmQHm6Bq/KqO5WfDMj9uAg2093Eb6CDZqP5mO6+wXoG2+aP/yK3xb5Y1VWtVn4F5szu"
+        "xtYBrLKqebO0cWKi1fJoJj9g2ewjL6WfDND22wEslWUbNH8yIPeIIth6fre9Wk5UXxsXMQSw+vAkSgN4gEoaAlgFQ/dgm8l7QI2tI1gdkvIOeG"
+        "SAdvEOYFXJD+rvyAO0qXcAq/5/UDlpRVVyeo/vAFaz2Ew1ejwgxRERrGUU5eZqh3JDtxAiWC921/aTASqciGS9Wq38DirIV+t+rIs/ZP3V6mDz"
+        "5Dqw3cIj2Syn6fyOB3BC/SWbnXYrPxmwBteBbFbhtIvPA9rv7kPWGZK3fzOs0L48Fugfsk7+3B4L1xP8aaL0Jeu6tsh7hgeoWCOSdclevLAubL"
+        "L35WokMnc0KQNWcR3I2kKh3NzpoIC2WfrTQ+FDVmVHaT/+i5Z3vLhWlVI52eig2dgLTT9kvOJ6p/25vmRaGN/xx6HG3cYnWdFBTeCcaH3LQQ7t"
+        "82lY7t55s4A6tVm2Y0BVP3bM9OzG1kZk/F5bM9TYzImsL2soFwBLYpzI8rL9RIMa0esP60R+ctf+KNBExYm247Cwx8hGtNkbozt1tbURbdGb2K"
+        "JPI1ppaYNWedZnSqaW7g16NOpEjaxuTI2BpxRGtAoJzF2/XhUSftdTNUYCpw2GNGsDsNXSfBSzvJ+b/gPufFOe2h0ykcD2unGkmWeDQhK3tzak"
+        "VtGlhrW3dqRulYFqPDzAd6Rarxes3tqI6hufQIGIhfCOVNP7e2I70ziS19sOD9UdyeECe7dAg3NHMn/tBQxbBOlIDdVAvo4ehCvy39Rbz7/UW+"
+        "ebnBoTywZe1omDzDDJyzSj9t5sqj7IsouzduAy2fIa1OXQVp6DLNuYmbdbSEiQJrSO9ETLFlwnB3rWEUyQObzvL0a0HMmWa+3UM++YbWAmHN8Y"
+        "O9By6lyo0dJ+NVFzd2hx64HmQ/W+k+r9Itn8VKji+iCrBqMNEZwWzHGsrc4HWSUKfYqgFnyidZD5coWbxZJgOGMOV11gEskmoOnUPJDUGVBb64"
+        "NsiojFzQrvaxVo8e+JdkFEr7/UYbvgbmt9oGXTff9rzwgkIeiYpO/xtY5oM+6eTWwwO2jb6X6Mu79oOeaaOz0cUuiB2aB2icmBliyIXJuo0AOm"
+        "C3aFyYGWxOXegeJ+VMr+r5iCS0/cD7SUOZHAhc7B+gVyh3Lv/ECWxKnR1g2/mDBn2dNPfCNaiuV32kl1JfQuMJOo7yYcaEndbloR+WuumAN0F1"
+        "ofaKlz2sHGqnwjFUzDZhdaH2jZsiLnxMaPSgEpu33vKqIlW02k1efJANVW83Z5fmTLKce4RhU1FsgD5HbX2YCWc460V47JE/qN3XY50HLaUdhO"
+        "ikVgKLtpt2OIbLec5cNNagiJFVqfbKvLGWx921E7uI8b18EWwRhVzXBUVVCGXO44G9Bmqtsa2dDu+ApUgJ7nY6r7ZcsV9+pIGh5SMqAK9t0FLL"
+        "KtIK83SjRu6uQB1VmfbGvq1LkJxI4IQA/jU3QY2VbutKhTENntN7D9WEDL7CZHkpm86zCR/mNxfbCl3Klw727KwCuq6bMtUgdb6p0KNc7isqsF"
+        "3sw72XLiT9XVsovSQBb3Fg6fbI5t1o4H5uJKr4W6ogU3B1vKnsgE6kcF5ah+YG65FtFyvtT2zN7kVdCq8biXRrYoYMjzkL7p/XZurMf1yRYzKl"
+        "KpFO4ZVLAuEwH9J8E13WSDlVxzvM1+U/rJgDS5DlxVMd5UVc8DdD8ugK1DZh0/GaA21wGs51GJlzYakNtiEayHsnQqJgNSkxDB5sA42ZY3TegW"
+        "VQSbuWQpPxmgousAVtcX6gwjA1R0HcDaz3PU/pMBqWWIYNVwrT3tyoDctYlglXD1tX4yQHUOAawqrtnzTwawx9wHrMqQHUH+ZIA6zgWwXqwk9s"
+        "gtmJ38+dgYf8BWHzLYIrdh/AXWU9LzAesNsoPFnwzQzYQANvniXvNlwFpdB7I+1Xud/8mAzeoDWTaCrrwXexmwjcMDWYJPykR/MmCVFoEsgee1"
+        "A8SfDFjdRSCrgWfey7kM0CQ3ktWNtGTuLFJAp97lcSX9kFW+Pm5qQUQDtgF5IKs0v1IZJQ/YduSBrGUHo3FNx2jYrkaRrCUVbWdIMkDVHJHs5S"
+        "JFijoKttY1kK1VSuF3kArWWS+S9Wp852TYPek1px8yXnxNtsL3yzEa1W71eX7re1LC9uB2ogbyFbP+psdEvT4Lb77WXbAmbErUIALUA8ErTNe7"
+        "90FHzSi+99hfM0mrVwUppB//zepa0U4qlIxMYZzIeJJLZ2TS4kRWmzWUF7ilKU5ksdmNEuNYYuLE/2p1BuaMzHsUG5HxDWWUY8mHExXfE7TG04"
+        "lWk4Ep+7UEw4mqU6zY80knqsxygaq73PLakPxc7VQCZN1haYMjVea6MlaE7Ujm70miF2hq4EielKkJIzYZcKTligtbc+lILRFMIJlueer50+OY"
+        "26+7YY+THKnFoqCM/amkzK9cPa1rgFJLD+MNaTvAoPu/PyUU1e9/rqeo2FDdkMYH9bQaTwuRTwVLA3V6eixgGPlvyrDXX8qw6XC4sgVu2kvwcw"
+        "BOXsONvY9Anrtu1xLJstFYuPHzGFdfSBX2ATb728bS0D2zlAx12TnQdsFKep+1I2RUIv1c8Iu275NtT+6dg2LkWY8KJaLlhunX6oPt1WZNWIOf"
+        "iJbca+xZte9XJ+rg232vD7TpJUYlvxWYDNQX6ANtXcgzSQx2znkXaDfXEy0bx5S/VW5O3DGFZk+f9YiWw652Ta5XKJh0wgUoASyBTyO9DXvwrt"
+        "awhkYRLXvV5OZGopRJfbuRUuwTLZspmQIltsVcBSrFPtFy5rvIxfyX232BhNF+6BvIEvoNPhGg/whKb114cqBNJNHY9XPsdwEVYp9oCX4qO8Ll"
+        "nRKAGuu4gdOBFvEDebbu37VQs4aJVGKfaFF20NxKXt876WlQKfaJlt35Hd0nEb9VrHFUJFv9RSJFEa4Y2ITYJ1oqTCa1UduLVb0yZh97uQVtRM"
+        "sFE3WD2Os/1d4uaK35gdZyq0at6clxtGFNrw80X69ROrIjuD0FdagKO5L10+3kcL+WYAam91NN9kXbz9dIAzXK/sxYEfbJdpdkilDJnwPVDrm/"
+        "XJI/bHsIFwmX20A5dj7mXAfbqqDy/hpI0L9AHd0et+vIlol0XpPE4Hs+XyhLMJtpDrasFVSdSKUu65r3wNqCHWzzhaVdoEQe2KBTqKfzZ2TLij"
+        "/26ri/ayojwpjfuAz7ZEtQs7/rRO/jJm967MbZwZZqqMQS1JSpocGECrFPtgSmOwlf/DZukNjAI+GIlsi7cauGVBLN79DNvJMtycXgJi3s4NzB"
+        "KuyAlsxph400t+9xgjQO3ZOnyJbkcH9umml3UtWxttcHWrJfSt4q+zbngRVhn2xJ8Pcc1ParO1cdIHXu0wAmsmUPg84EafXad28D9/oL7D/JsF"
+        "kYOkUfOh/layHNKA9AhUHkqhKg0K7SQHUxdr1BAJuDVKUNApR0Ir2cpN5ga6uepfl5nmAZ9gdsPawzlYihXPNejbg/YJXOFxa4Y9ZmX5o/WK0H"
+        "4L5wPEAbdAew6rm4YxoP0Ir9AFYRUk4sFQL1g2iP4ukDNjUXV1pgfIb7U8HxwprvL812PCBVDhFstr+0484DdMskgN31d4g370AqICLYTH85nU"
+        "KVwcxHNPkB28EndSbkAWxQ9wHrKW7bd6cM0LZZAay+aXVSfyIaoMqJSFbzw7rGTwZs+6pA1uP8ur9cGbDy60BW38id//5kgKbVkax+cXVyB4QK"
+        "qqXMT2+FD1m7RpBun/5i1RcfrsoGyVRIBqwSI5DNYzhzg4yesX7XkWy1MDs+kQGq0ohkvVrZiYMM0DQvks0XmqqaFkwh5Z7XgaxCINq9kwHtef"
+        "0ha9FIL/UnA9b1OpC1yo06/8mAbnH+IuOl16RB9YyRkrmMNL52IN/cVITYoOIEI+rdvAa0BtWJ1r4esxHq0msjarq4BjTBcaLK3jumCM0rS42o"
+        "mv2O2USxRMaJmgTOgU1djGgmw6Cmyo8CLH0UZjfW1+td+b7/UaApifA0hK6YcPbVdqc+cSyd+3Vk0uFE64oEso56GmK8CsTp3GQiEwsn6gI2Cz"
+        "SVcKK2ZevghjmO5KWE9q+xsmtHqh1+AwXRLrs2JMvG6zWxGYERWfTO54rQFMCRzB/XXbH9Wx3JJQd0KoIN9R2pJQ1tVGhw70itJ0mg1pPtaSCS"
+        "3IBw5muCztotgHekeUfPDA3ZHanVQjdItO/e14bUYqcEstoZT7VTcm1jL1cBmRFbIK7If1J0Xe6/FF2nmxotUqNXUn/5DlxKXBVOztEVkz17K9"
+        "tItobZZOxI9S1I4+sv1uQRPU1xWOxY1+sDbeqISl7DlFKDaon7I474ok1IV8lgkXawWkIKrk+0SQXTKHzSPjEbjS44OdCSs+x7lvyMckclL9nF"
+        "kBEte8SNbtb9ar0aRtnmhggHWk4F99O4M56UKdOEFt6eaKmVWjtIqPxqw5ziu9jkQJt3G1tw7889QXbUL+u2L1q2p5Oce5O+Fiu5/oJlyyFRi2"
+        "cWg/QC9b4+0bIdvjOQllhDdGN2I9zt70DLjnjfb4OEWfdVMYeTLjM50LIpTpqz/eJ+MEGHhu4RGciyJ5X3i+SLux8TUPm1b05FtGwgZ+7/RyqJ"
+        "OSvWvCmizVmUzPHI+RvU7XK8jEW/aLPALXSwOKhZS0cKrk+0XXAMqoDad24aWNeoiJYLUo3AfnUVVOnv9OqxiJbfsHJ380xyZYwz9PKbJqLlsS"
+        "CtIlnqkHXswtpVRbQ89vVa9ZdTQ3VbfqyvI9pLnUjKknfMeKOtryPb5GyZCpIydYMsYJusyDbJXtkLJNVcVVCFdMqPZO/LNlHiopuJumSBPIVT"
+        "f1SJX7bEF4Pdz3KhJhgJbNAV2XIOQDI3Kr26dyS3oMLrky3bpGVHxYtfXSDFvgfCB9u6JewYgF8Ft2M+0NYOgqrZ6MwadELkcXBEy7b5zc3lyS"
+        "4adR5YXXwS2SKs2dNrpVKhHUWCqvEfQ7LIFt3QjsNvKvHse3FOUNH1yZacmwwx2WYc1HnGRdcHWnYT6r46FwvVG+yDFtGyW1J3EEBLJc0LFaq5"
+        "PtlSyNK5PCmtRTXeUNH1yfZaKzJHptZJCWzAdrC1P9I99tsgSxvQl2oB8YGWT3izj3rac23GGl8faLneTgPSYvsB1Om6+0wE9p8k13ntECj/ZH"
+        "gcy2r78V+k4PpDVSXXyuknA3I/LoJVynLfLDi5b6ziIIBVx0X7gTJA9QcBbD7DkwVXHXO+8DKC+4BV7ZQaK6BAbVqflhRfsF7sTuw9fCeoUiGC"
+        "zY23l58M0G2iADYj6rJ+MkBdrwNYNYw3+UV31AHRs1/zBavmZubykwHqeh3Aqjyl55z+IrdNvlgV1Ja9bsgAVT8EsGmFKwt6K1gJ8cKaArqIUB"
+        "kkW3jcrD5g03ZTEzYeoBXbAayq9UJ6bx6wvcIDWQX5O9L+yYBtHR7IWmtAPR4LqgTO+4h/uObz27h+o6ErmAPZKkMm11XcYKl1JFvRS5balIxV"
+        "XUSyXm1R3Jlhldnl8TD+kK11yZ6XZcAmloGsFVjsa9xhjsnudB3I5l2X2k8GbIYXyCp3u6W87QYJ17s3pfySVfE5O+0T0IDtMRTI6pI4Fvu/j4"
+        "XVdUSySu/oqZAB2+vnQ8bLranLlpvEdTKmrsC0yIFqfJpAKXZ239PkiTVZYmBO0Cz5caIq2HqD2q45Uf2KB9To2oCq/gL5gpRH/PW4gcx0Dcxt"
+        "YymME1Vb1jCHzZa0OFGlZaDU0tIUJzL+viq0GNSAKgq9MbeNJSJOVE0ryBfPkg8ncgZMBYvYFjtGVEVxK1BDKieaHhqqtjagGgPcmKOP9VgC3M"
+        "+BR7tKQxdqlldcMcEO147UZKuhes1WT7Naf5X4F6zU2ohWfVHAKYAhrXgkYyssHWm1L6DzlfIqfkmvdhsge/fHpud++bvvMLHcWKm1I81nY2Jr"
+        "JR2pG9gdHK47Urd3Z8eehDiSp+U9zaHawdi8bEhetPZUgbKz0SBckf+m1Dr9rb81HTWX9pM2qI8ucS/Fi09Mc29ApfUBlvxrUdeY/eq6bowFgS"
+        "08B1mecWouS8fs5JicsW46ES0LNhVP8pF3uxNSbX2QZY7c2W3lF2+Mf4+LTCJZAgYKfRp/yXUVrIVPREsEsV9NfBNNzN3pzn6RLBu2fd9EpB8g"
+        "o8GBFFqfaNmz3fEM7Ycn2CGdewcdaNmU23lDIwvxgqpxdIHJgZZ94p3fipHpwsSavgsYyWZ4Oel3vW/UOVN9uc5+0Vaq0sldbOX9bjJSan2iTX"
+        "uRmyg/60IqrQ+yXI567lXuG5AKtF3tif6vVwQl0Q5gSvkeaUlEywXH1akBX6cerBkptT7RcsuUa7XMAuwB6h7lt0xEy75/oQJYlpiDViWXlhxo"
+        "eegrmV6KiWlFKq0PstU4DXJxomPZhvWHOtBy2FD5GDhl0gpDhdYnWnI56qC4uKYEtPPr3tYHWpI7MjEjL7O9/kN7eB1kOQPOO3Pacw+56oFsQ2"
+        "8/Bo5sKXEqJKHbr4594zao0Ppky0nHvnV751frjTW4PtmiFyDZLn/wilI9W/Qb0bIZthcQPga8UXVqj8z6YEuOTVFc4uIu0K7/Y8R1sEUutmdY"
+        "bg47rjGx/tYnW4Qzt1j97ex/gk6tvMHLwRZdUBXXa1J4Dey59MmWvQy19q1tr9AZqrQ+2VZJQp1KqDi3gBy1vcfLwRYdGc0KlUuPJ9p/LKCtc1"
+        "Xpg0urYb2m59O76su2kq5CEgc6WAFtTbX81HR92dZsqZbKUtq2Gtj4LLLlijv/boPFwqUuqNj6ZMudukOPOrg3wwCVWXjt4cGWp7HwrECtWUYG"
+        "W1wfbJlx9qxOu0WkjgEpih6P68i2sqdK6eNeMTvKeq0/ZU9ftqwce45t0rWkgPzt3ewtsP8kuE471qNbm4eX229jT16k4PpLVRVS4YpzGqAGCA"
+        "FsjdQpXeABqTmIYL1Yp4eJB6gPQQCbAG+mnwxQf+sANm0hNaXgAbtL9QWb2S+ZLvAA9bgOYD2j7KP+ZIBuFwWwSl13jPeTAalkiGBzMaOeRQ1V"
+        "C+wtyQJYpcmkZZcBqXOIYD10H739ZIBKrgNYpeTlzj8ZkBqICFatQiPbWh6Q+xgRrPL/vOZPBqhAIoD1tLJRGQcPUL1EAJs/7U6NZYDKJyJZr1"
+        "Z3JC4Dtn46kPWLXLP9ZMD6XAeylYg0LuRo2OT6w9X6ENqlkQHtcf0ha9VXafMnAzbBDWStEFn0Gg/ojuMfsolc5/rJgNVnBLIKeGtfPxmwao1A"
+        "Njta6jRYUJ1nH+1GIKvEZXYqfoWZ8vXHpfZDNjlT+fFfdNfyF9fE8pkV7Rmq7/hytQigiVS/Lay/9ZeMF1zTPuPbRnhlZFZkQBOCLaje2ommYw"
+        "PN3s8N9Viy0A4w1t7aiRafYyqAy9OF43GbJb0itKG0ATUCB3XnrY9689WUd6EajHvTuvXuK95Q7iztCUIfT5aa6DQdmZc4kfH7CcOceVgm4kQW"
+        "rzXUkuCK6/ZaCnpG9cy1bMOJjJ+ozMnyCydqhcfErGGWUThRKzwaZkqwHMKJWsbQOzZrcKRWkNygSMnyBEfy+58wHyfLDBypdRgDVR50eyHGeO"
+        "qD0gV6+y+Ha3/3fWfADau6diRPDOu6QduaFuM7kvn5urH+1kZUzS+o48DTraa9Wg7s3LLcWHtrR6rmOk+45jq/+rdSo3NsUaQhNb3JoNJcL4M0"
+        "pCU0C6u5VuS/qbnOf6m5zuTtSQIwqsPuT9HQzeZmbK6E+TkswjrIpvFecydmOzPDZALz0Xh/wGbvN8n8J9M2KrSD6YmWQHV/2E6SKeo+BxVdn2"
+        "jZqqIyIem1vFZFyq5PtJnPtiqNiPOdsF4+ES1bmjclGju7JkVKQgqvT7RckEpnSDKRUJ/QN+QOtJ3jj0qmFrBw6TERimiTf5ADDzV4L6CH/n7k"
+        "H1+0fcJFfvCDSkUnUnp9ou03HCyYgHm0Pe5FEW136aB22XOnZhhvELe5PtDyHJKDKh3qNVSO8IQxES0zDfkJsAnuwjSaelyTAtlEEXcq7PYH8n"
+        "13pcmB/q/WJM0xWZuRQery+ZQ7fdESIHJLhkx7lAl7dhjJstJn6ue1X6UYHmpyfaLlHDbTJCeOlJhpbXosE9Gy/Z/YiZqUJ6NDtdcnWoS7+0Eh"
+        "n+b9asPIIaf3LI9oObTnpZg/N0ibuLz7QkRLkE59zDvLh+ZoWPF1RJu6fNFkQJvpJUPV1yfbmoTMQpqs/cEbVn19skXBcvMJOOnOUgHbYwW0mc"
+        "7mMtjGNIN8q9LLdfbLFvWRKqSpXKgOqPr6ZEshy76L6H2QGBy7I3Sg5XrknUVhxw6SQc2J/dDhYEtt0LoShXKD3JorVHt9su2KN7W76AXm9uQ1"
+        "iAfbKti44oRUizdWe32y7b4h8eFAZU+PyXUgy3OxIyq6d8lKvGGNyCJanvyubZHIpLlBddcnWw5Z19VZ+UgNmSZUd32yvQCKDpXJUSGBPa4Ptq"
+        "xRiVprcMXJQnWw8zUqsmUZvjka2NHc1QbW5Ppky2HkkoJIqqAFHUH4NuPBlv1G6lRM72OHWKgDenfUj2yJF6l+J/GrdQ2o7vpkW2OESdnxfhXl"
+        "e+ibn4H9J901qdRS+snwam/e808GpNV14KrIqu6IWgbozlwAq8ZqpPaTAWp2HcC689/Y2LthW21/sO74NH4yQI2uA1jPG/Y0/5MBKlMIYMmsrr"
+        "5for9QzcIHq6KLVSgloAGqXwhgFZAU2m7kAdqqO4BVun7vuUEGaK18AKsof8dVPxmgjbwD2MsNqlQFQLuDRbAWUnDXRVBWMZ6ajRfWalGKlIwU"
+        "qM11BJuRcWKT3IaZD9fLx/gN1t+Lt4QLykh+PQU9H7Cp/OgMgQes0XUgq3qR3KjpLzaP/3AfbdsPJ3F7fOwCWQ9n157JZMB2jApkU9JmlrtmqN"
+        "jiy1WFcKHOSjxgmzYFsqri7lV+MkB1GJGsym5qvikDNLeMZK1FWbX/ZICqNCLZjDPHj/9iFRsfrobApaafDFj1RiCrCCUvrnPIoP2Al3/eh2xd"
+        "WBaH/H0lqLIjkr3MRhIMcBvzLxmvtx7j1UR6p1UY+63uAjP33BqUHEILT53IArN+gWYCU24qUI2/QSerluA4kcVldJwLLSZ1Ip9IwyrN/Kj9XW"
+        "JW9/8Gk5K9OvT08fQ4vjD7+PVJY9tr1crYHjxO1NRuYZqKeRGoETWhGxkqtnai1wAsaNJhRI3yQJ1FxlMg8eooMlGKlvkEj4+Qhep6GlRs7UT9"
+        "7hMmNXp1ykmlvgSJqKazr9Kq53iavDuwRZmOtA2a1aGpgSO9C94C+xop0gW5C1tuaUiek+s1BrZTqyPVRLiBPMBdbm1I5u9HDXS+4XprQ2pjAF"
+        "gHmds7AzytY/raXxb2fMaRWuqxQPenheyOZH6HFRtYkO5IrSVBdbkZT7uQp70NV5YUaCCuyH9TcF3+UnBNJrSJ7MXIQuk5IN15baZj6EmeFUC9"
+        "9QG2/r87umApQcM0AJ5P+98vWY7TdwbI7V13HtKxljoHWi7YqCbiRye1aSL11gfZ+hvzFnGjVk4ZKbc+0XLBfs39o1byXcCWtkay3C9J3kSlUh"
+        "Oo2PpEywV3CNZoDxfV3fHpOhfI8vTRjhkZKZL8BHqMdaLlYIQfflYQYLIe15dEsonZuI8glV0XqND6RJsWopH7XipUDgF1LTrQkgQs7hOX0mZi"
+        "UmzXlxxoSSj3Irf227gHqkmE+zwcaDPSXzsCJw/sMrB2SQdaasP71XfKkm7yvZ9IqfWJlkyFJHyT30bFNBV6StgiWrY09r27b917XjdmFXRlSS"
+        "TLTnyVLu77RgJl85bQRLJsxe8VkWY6+o8YU5fpe/ERLdtPZLmplrsZ2i7rRItWJImahhJejCXPdNvZiJZTgMJWTjSZgz7h8mOAiDafy0IebXQW"
+        "ga0oP9FWsMLu5Xs5BrVOuu+nYOWDluu1/S4WxxsT5AV0u3VoZHsdV9tvo40r1wJ2w4psN/KliJ8ssEGCWVc1HWwzZCWlDgXFCySY9YLDgy036l"
+        "5COOpfGWxyHcjyHO5gY0gjCFStvOupDrZMNaRrKZy19Z7+g7W4jmw529zxzU39uqn3RMY6gB1sK3Wi5rd3IqdWrMN1RFulE0kT2WgXZFTsBtcH"
+        "W5Rx9LnpfVDd48Cehh9sqXaqO0ptXOoxQL36XEt2sEXL0Kid1X417VcTVGp9suXoZj8pRV/FOp4FshQ79R1TTf7UqO7P3ochoGX/fz+d9Jn379"
+        "pAG5WPyDqyJXnaCccQA2pQ29GX01pkiyiQGlAMfj5RhxF+kHWwJQHeKyV1ZdnrFyhBdJH1yRYFGJnqDmjx0eP09mX/0dx6SE8DHp5jrHHTm0ZZ"
+        "4T+HWR+uuvwmajzOA7TlXADrye7M6ScDUnYQwXbaReIuHqDd3wLYhNZ7xpcBLbR+g/WcrezltMCaQfjaHMD/I+aj9f/Le7Rdaz9JMkDlCwGsQq"
+        "6dYv1kgFrHBbAVTjR+bTSo2DqC9WI7Xea/SJ3DF2tauM4XLx2qeYhgM93t4ycD1Nw6gPW2n1TgwAN2/+IL1gd6da7cWB0qto5gMyRP5ScDuBn4"
+        "B6xW69TETgasciKQ1cOy0ZrDA1ZHEci6dC5qIckDVlURyNbBmiL8G3YG/xJcf8jmw0pbUDzA24q/ySqSvzur2e8ObjIeyFoAULmdSMVa3325Vt"
+        "dALbIK3Nw6kq2jR+e+G1i59ZdrxSGD+4mgak29njaQrddL5c96V6x6I5L17ripKSUP2IQrkLUsqlFpLQ9Ye+tA1oqvdHNhVrrBBtcf8v+AwTVN"
+        "vOPRny5o3x8HagyayoDWmxpRrYRBBleW/DhRZcsVozGzdMeJLDErKCNkF12XlxFy32kO5t1bSuNE81PFTCH1ZafqU8fY15rIrMWAKl4roJbN1b"
+        "VrxSciKjroUIdrJyq+LGjdpxMZX1H3jSUgTtQqjIR5Zi3lcKJWYWDsDNzgWoEMT6jdZksqnKje4iA1vaURTuTpbCkNlzg4kvk7xE7YykxHas46"
+        "MV54T+cbQ2pJH6qxo5+yvfs55n6NhjW4dqRK3kFP1lNnWV6PVqaiGGxhpRKt3qCDXXoMaSW9qHrGp16ieikj/QN097cnvaspvVuRYGskHam/bg"
+        "Kda/Xn503PcRas1P5xuH4X2VNd0sAG4or8NwXX9S8F16Q7KU0cvvKzITapiIX6A+crY9ay+nRz/pLleuTeRpsSc/9WAyi5PsnWITsnbkaMqml/"
+        "9cf+kGXJ26GTuN+WuyAF1wdZ0jUy3Oz71X51TEG2r4QH2izDO4lAV0L597vg5ECbOGKRAG2Rx0lBSq5PtOwQV+r4xI2WMRUIrjaJZNkj3uFqST"
+        "/2GcNIeNw56EBLUDOv0iefQ4P691VvAxfRMs+vq/HhfgLVW3uTu0iWoOrmtvX0qUeCNoo90aKAzldf0pl7YVxnXWdyoCXw2jNO42P9hEmdPH6J"
+        "ZNk321EZVSasjDpZeLySItosC1sq7OidMFvHvT6OhV+0VSH0nLl/PEgh7NueB1q2WakrAvU3Hlr7hKuXPtCyi5yvVEWseGP2Wl1lcqDNynPRDu"
+        "z+wgsmCp73Y+X5RcsFuW8HS05BrSUeh6iItlog0niQp3DF6Gjmqxboi7ZPyA6m5aqYWpmVnw/4IZtJ8aS5Z6fcrWGNqQ60lf5xBQ1tSIMUbe5t"
+        "fbDlMczSmXJnzWN2qOj6ZMtMU65Jhy5cJYRtLXayZTIdOyqWMiGQPcDjbn2wzaP8JlO6e2erIG9Urzo82LIg7ryb5ry77Ru4QjeETras+XsOom"
+        "q2O+/3saDC65MtYc3ONrgYakfHoLO57HFNZIuegLynqXhn/99usB3YwRbRGrn7Fn51Vay/9cmWw7QdGlNIvr9rlLu9R8MHW9KL/XRSHndTJDLB"
+        "0uvIlgyqSppzD6o7gUqvT7bIh2inYYifMKjswtu9HGxrLJWGtLeqGN3XywQtsiXR79dNiyZbmC6o/vpky04GdUugNWzsNSxBBdgn26quSObOHu"
+        "agteMxYItsuSJZbpCLJDWCTFAB9sm2Qq+2KPghLRVUf32gvbBsf9F7AmygSdV9377oP4mvd2Cybm6jvtwEJlPTEWrIQQNSYxC4dn7Auy80QK0Q"
+        "AtjsfvP4yQDtsB3Aqmvh5ZQHqClBAKtAaHGfARqg3bcDWC/GfsMFZWT82AN8wSq0moXNcmeB+lxHsOusqqihoJtGEawXG2RIzQPU6TqAVdO12F"
+        "iCBujuTQCrmLGLNW/HTN/udB3AesLWaUccVP80nlO2F9b8fnP54Tp1jefA7QPWU2Gq1pUB2qUrgFU0vO7ykwGpk4hg1UPvZf8nA7RZVgC70juJ"
+        "IBsrvo5kFbGPyVrzMRu2ljqQzeBS2iqA/MkffUUgm7twbj8ZsGqLQFbRSG/cn6K3ibW7C2S92hpc/QA6jHxqiwNZrzY6v4MB2hgpTxXHh6xXu8"
+        "lRmQdsohnIVjOSuaJpgmr73fE6kNVfO5HHMQ/YdC+QVWhEaYQMWNfrQNZpcs71kwGr7whkFTnVUn4yYNUegayiD3qJ/qKVH87FC7DL3FnxeG49"
+        "UEue5457WvHs3wZU95qeWqFXxSt37EJXnz4/b7pWhQqwnahx2I1xfylP+c/92Lut676hAmwnWriK6fBRX5Hq09qDnuqGtRhTotVl9/9gu/I8rS"
+        "DItBBaGepEvesTZj/ZXa+NqMXWExNjum+WEc1Z+Ia6XjvRu5oVaJWnEVlkXFDKJEstnKga6VGgEmwnusIbK8F2pArUc8VWazpSiz7WxKYIjlTX"
+        "4l6xSYEjufggozwFPA1wpPIXKIWywN+Rykd5Fk3Hu1PRIGEX1r7HkVqbMUEtMtzz2pDMp8+SoeG7I/npJQHcgAbsjlRP8ztjJdiOVE/2BTojtK"
+        "DckXIYsT9MAx9CMPLflGC3v/W83nNbq+KHWdJTiFCusuTYFjMXefeJADaxRGcJxX0NTG+q+UglvmSTStx7biTR64Ce8xxk2T3NV777b1F/04oU"
+        "YB9kE7fOPXeudmHiV/clCGBJ1cfV70SvzYJ19YlkSUWpdLfQB54YnakLTiJZNmz3wrwG/Zyggyzfr/2CZUeHNNiVJS+gfNt9hA607BqQ4kWsfk"
+        "GlrO7xd6BlP65fhZx+KZwdSNn1QZZN4sEmQ2SFOwa2+9KBNifKtqhJKNlRI1XXB9nUFzcfGu7HP2Wk6vpEixTiphLiX+Kd/wx1TTrQVpkzOxlC"
+        "LJTblctLDrTJSyhrSft+ujH581td8kXbVzrJ6rflq2MT9hMtN03fSwYJedf+hRNSdn2i5aFY+9V96+4kLYEWdxclRbQ89jveI43LzhtAp/S+i3"
+        "CgZVqb3Cydyq4WZnvcva4PtEzclK/TeTC1rMd6XR9oq3hK1JF41qtg1HNuUnWgZeFt4to4qUffggqvT7ZEFiSq/ZEJJ8iGyGTXkWyy0jtR3dWN"
+        "aon9WGMdbJPOZu44vv/r3aCi65MtYW+7GvUroSJP0G/4BL6RLXE99U6VUhqQS9xjynWwZfefvBcGVyRWUGG7B8AHWzKzPcnyq/s7B7mzesOXg2"
+        "0OtDdPeutKqK7ILwfaL1vEakuc00e9QHawfvoR0SJHmteiMuS9noDMIbznS0RbrVUlUXTfyfCNFVyfbFF37XSbWs80Lo+ACq5PtlxxB3QUIbcb"
+        "Zv7nbV8Otmjz6FQxcc3Q6gNsgxbZ1gqJXyVbzIw1vD7ZVpC050D6AgboS+2vbmQftHdfIh+xTOqbjrVfO9jmBU1PKzcPw7pdB7J7XVOBPqk8Qc"
+        "4hH6/rD1vUiDtTpTl2p6oVpLhx07fA/pPcmmxISenBw8teeK2fDEhFQeCqiqus+ZMBbPD2AZuVsQi7QM2M08vK+A22izVuUw+yInVHggDWi9Ud"
+        "mcgA9boOYNP57fVMBugeVQCbpGrMX4GZErnXdQCroqqSpiuh+gf5ZlEAq2VimT/+C+7b/cKqECCRnJcHqJohgFXUMPaSKQNY2/ABmxkQKWwzSr"
+        "o7Hqf8D9icjW6yWaABLLf+gM3slyoReQD3/v6AVR6fCwWoNEA7gQewCv8ndTzgAVq/HcBa0sCddHiA6iUi2b2FkzgAYw3sItmuJk65GWQ3l15O"
+        "xm+yFYdQoWqB9VPOT0XPh6w3SaeUiQes13Ugm9c1WfzwAPe6fpO16Gtwhy4asG7XgawCucndVmhA2+J9yDohk5O4DFCFRiTrWlP3fSoDuLXRl6"
+        "yS5JlZODxB2qvujZu+ZI0OEq3iYCu9F9Uk5ByWgPUcX67KBckzSAastuNDxsusyVvVI47e9puowKTIgUyf+36DyqydqLK4ha0zdaJ5LSeo+ZoT"
+        "9csZmCNOS26cqKoyrMragCYpA7l+5UdR5ruJbVwdayrmRMbnK2NUK5akOJH1ZNRuGFoD6kTG36i73lIRJ2rq3So0+XCiFwxiZdZG1EWtV2gzYC"
+        "dq1WjFts9xogr0842t2TSixU7otGG984WFKlh/EoX1LlXf/wAt7OnlhZxe77/PBjY2UqQVOKPO8PpT2vwc3ZUrZWzvVkfqw5UmtqLSkTo3pIru"
+        "k6pIK56cHV416b5jex7NCSu0diTzG8zqy0J1R6rQurWOFlo3DzZJ1Q0S0ltg7kgt8wB5nFgsLsR/U2bd/1Jmnfd33+jIclL/E5+DKtX6TT7+7h"
+        "g3I/ehjWTJ0Iuk7WNSg3mg0Pokyxw+yddov9qvjO1mGsmyJJWrkd0QdVJZUKvrEy0btXvGpEPTnQph1ipfCiNZtqrmnqBF71ahudZBtsPRSftX"
+        "ZIgHFVsfZNn2W1ejW4jM4DFbOr4Td6DlgrTHSZvG+7/eA1pke6DtND21Ja6mCyq4PtFywXEVMsLFCRSehncRbReclUyT0g6FEta0KKJNStPJeT"
+        "c3VFVee9kWf9FywUaqul+iOuoFFV2faHkKs8h4E3moQTtCnWiZZfJ1k5qPKoIK2Os6omVPvOzPSyVI5RqY59A1Jgdapu12jdJ+a6+NC2t1Hcmy"
+        "LO05vCYqLcGc9rrCJIAlK95B9r5rF63HC6m2PshmbT/2U7loax5sDRXIEjCRhmf9FrlRN6TS+iBLDke3TeMXO9Tf+iCLBvmmBJJeXGth3agCWU"
+        "4ZqAvroh8UlCjd7jP7JctpA3lccq1aAuX1tx84BLScObS9ME16FGsF2199yaJUmTqz7fUXLK8+2ZKfr53tdva5XaBTFW/scrBls3Neraq3Ntx2"
+        "K7KldmRn3NScmCR7WEvrAy3FMdy6UySJs0DF1SfbegHdVP5QSKy/sHZfB9uu2EnITn3rFlRcfaDlemQzmTkyvTvWz/pkW8URPTwUfN+rgm3GIl"
+        "uumK9FEo22l8i2oPLqk23u0uSuRikUSgHixYYHW+ab/eOWLMVWDdtl+mTLnJp37ps5B66otnVeoBrZskbtf5Ef8yDJboHqq0+2t3Zis969dqG6"
+        "c81Xc6cPW4KMPbeTie6YVwY5abhy7mCLBHF/Yt6JaqDy9+EO+l+yxGw3mdnIThvI6d0t3QL7TwLrvZh1NhSn4aVKEw/jiSnEeOyKP1xVUrXOeq"
+        "cGups9N/6C1WK6s9c3DVA/6wC2zum0GcADdCcsgFWPubgsCmXdUp7mnx+wnXvtOUMGaO+1ALZDsP3fZUAqFCJYjX3pJfoLbYH2warmudFLPEDl"
+        "1QGsWq225z8ZoALrALb2wuTgygNS1RDBqtqao/xkgGocAlil/mvVnwxQxUMA69lmX+knA7RAPID1YmtH4TIg1RARrBcjPa0M0DrtANaL3ftxkA"
+        "HrZx3Iejvyx82o7/HtZ/0hWzXIfuxlwPpZB7JOIr3zs74HbN1yIOv82Ev7yYBVWASyTvvUrUoGcMumL1lXtL2U81+s9uLDVf3RTVfnAZpkRrIZ"
+        "wVIsv2DdQtqjuvmQNbzKZN/DA7aSNpA1chyZe4iMjLXGi2QrL5BSEVQLMT9tCGTrhSKlIuvGyqwjWa/WB5dT9IF1s/6S8UJr0n7ll3Ztgdx3nL"
+        "7Sq0v9BCmnXI2gRC2DaCCDTRdXKFGnU1C7VDeaaK8uqdywoiOTHCeacTDm1NQ3HfPrwLsM2reGVooakTVl+SoVmrw4kfHUbRwqtXaiKrkHJjO3"
+        "FMWJqkOvmO4wlpQ4UfVqdUIPa53I+Ho1zE6CJR5O1AKDOqCO1k5kPG1XLGRy4UR9961A0wkn6nePCnstgXCk3jodq7Q2otVfgM6KLEVwpD62qP"
+        "O9/Dy3z7HeniNg/WK7TztPm1juOgyN+42oM36t4MY1hrQuStgTJAHqWttAXTPbs9g2b5a5F/aEPagxosY5HVwKqUTbBgUFzP3V2exdfgE6GhxP"
+        "dYRvMFE0C3axVuS/Ka8efymvLlTWWtdvjas9+5dlcfPRO6E89uwRjmBzgWx0Fn33qwCV1ZErp79tx3WFOw4X0GaYH/5GtBxw3zvSa9xwGNWw2V"
+        "ugRbRcsFCtxS9l6lQ9kdLqEy0XrNckkQ21Gy7QI6UTbZ9wcH/RnVInpLr6INsvyLcRCYUxpudPW7mItns0k9N7JXsvaMYXyfb4UfwkUu+K1Faf"
+        "aJtd6EVqxQ2yyH9NLx+yxCE0DZDn3US5MD4d0yNaNsA75S+/RLHuRAqrD7IIIcpV6EiZ0ibMvpyrSw606yBIMb9TkY4Jk/zk7kDLrjtdfuxXyT"
+        "u8InXVJ1rCv3UVEj93+n0nUld9okWdW6+cJr9aMPU+riw50BKC7i9aPnbBeKG6siSSH211YplSwzSQ+oqr32izl81JzDxB7jTz5S77RYvSgfpl"
+        "VLbwRsnH3Vw2ouWgYYhdaevXDbKEcm/ZiJbqhiFFFm1PPtg9jRNtZradrIprvwYoj7/vx832y5YrFqoj3a8mVOZ9e7f3gLbCrUqe4aWjlsKnpP"
+        "1gm0lo6WJWCmp8mdLLJvTLtitWOrciCzpQAOy1hQfby+FW5mqgBCo09urCg233zSTHNjrkAZVP5teN82XLw3hfN9nb33sZubF665PtJZS0NN8F"
+        "rrc+2TbDrX0/rb1iggoRvMowomUK3yvX4r45DdPU5TGzjmhbo1biOp0ysV7WB9qaN7X9JiYd6RWo1PpAW4XTvdetSS2dGlRofaAliGrcOoe6E9"
+        "zg3buINr1s3vP7fhGlP74fteybLEFwu3Y8Tq91kNnVEwQHtAhrblY37J/0rgVspxbQpue+p5aRYcXVB1qyNDqf3I/I/m8otwiXBAa0pKFdpoCd"
+        "2WBqQ19Wbh/0H82rEycEMrxkVIv9b/tCtsOOXBVRrbx+MkDFBAGsO/lrB9IyQKUFAawSqsXS3dWhMoMP1lpzl/qTASo5CGDb8F8scwKdpr0aan"
+        "/AqhingkQZwO21P2B1MB1kbsADtOQ+gFWr1aimjAdo7+0AVqnW4GIrlPmfV74HsF4sL1Zv5QU1r45gvRitVTJAK9AD2L5GaubGA1LiEMF2g7Di"
+        "DrMczdft8WDtth/tJwPYuPoDtgea+tTwAN00CGA9+7ylUuPuFSqLiGSz7b3bTwZsJ6pAVtvee+eBMkBFE5GsJmz3zshkwOqqA9lCgsXq57Xguu"
+        "oPWYOdsR8JGbC66kBWPXzeE5oMWLlFIJtMsM2fDGj5xYestSdksF5w1u3ueBfIejW2LC4wM2Q/6Ahku9pOGgpuu6M/PTQ+ZPsmG/fVAB3aPsWs"
+        "gWx3Seb+NRWkUh+vu+RNtoqQHYbJgM18PmS8tpoac/mX1sgRB6mtdiCLvSY1bUamQ05kfCEPKGQC5ERtPn9jlCJ+9m9E653TsR163gW4tGGNWX"
+        "f8pN2IurqBhOf1yXRfwnOKWLGFoUa0bjGYScKLQY34FANBD5Hf1T87YAO1l+xPNfDTVJL+gaknHU+gWR+r3UQmXNCuOUb0RkDQs9H88tOihmVQ"
+        "D2sFWnOmhrWwNqJOCB20N+WFmYb0YtOBLcU0pE7HIJuh9EzHXmRUd6KQsC5GjtSlEFRu8eiq57vegmoRsQbWjlRde5rYUN+RrMrfiI7VVjtS2y"
+        "400CmmhfOOZH65RknQAN6Rxk/QiN2I9u2AqtQsRO/vMjU6+wFVFYzn181eVUAlEg3rX63If1NhPf9SYU1Sk0SKqFyuMp7d4HnNnNhFLYNUiXa9"
+        "SDbBQKVew9yeDCmzPslyvZ0eNDUsRVne2QUjWi5IvmIiIQAVELg6KZBFnEDNyUhAkDHRqytMAlj2UEmlOEk+ANpEdXVJJMuBT6XCUzovnWD76k"
+        "iWGJpsCPgwf2L11QdZYurBltaTCumgrYsOsqkgqLXwhBnc1fsRQXzIEnXvu7TuF0mqX5Di6oMsx6s7MFn8YhsJa04UyBL2k41YpRdBx7muKIlk"
+        "UTrTmWv7zYZqXuqCkkg2W9neE90/C9vZ6SBLkjPZmX8uVG22O/ZFslsE7l+XNUkNqak+yP/VwqZ7VZrZFqZE9jFhCmTZvyW986So5LoxVtwuJz"
+        "nQkkKyKiDd1GwRqqg+yFYlMufiDumgltKP9VNESxVM3inhjioqRU9IPfVBlssVWnBF2InZ719eGBbR9vm6alczpkzEHacOtFyQOiVTMRWFFhUq"
+        "pz7Zcs+0a1ArFXKjmlA59YH2skXuwDvp82O3Vw62XDFdi2LtmndAk/+DNa+ObJnWMvWhY+E6KHx5zKsPtszbmZpDcRHXAJ8Fn2xZmPb/nHob7/"
+        "u4QsXUkSyLPHVwGVw1VlOCSqlPtkk5byozbPsmbuBOagdbTvOTyNZbvwro7NSj3oMtcSi1SpcXC9a7+kBLmE3eUYU/d0OZZbv+LrJl8zzpq3sd"
+        "uStWT32wJVGi0qrCZTJrYK2rT7ZkgmPnFvJ85gL2MzvYkuruHIqKD/YEv1KHyqpPtmTydE7aeJ4FHba4svpkyxXTlaigixvzgJ3UDrZsjrSraG"
+        "EzyvTcdXMHW66YLvIlJw+rhfWuPtBWLNY44ukVu7n5Jf9JXL2XUIplZXhOwkb68V+ktPpDVc1WneMnA1RYHcBqwbLv6p8MUGF1AJs8/RYvzhvr"
+        "4BbAevg3d5wpA1RzEMCqjemLNVwdM/eUx5f4A1bZTy7c8z1j7Ljr40v8AZvGaE99MmCr7r9gvVhabIwMKvFvj57pA7bf7OYCin5Dy98j2I6ix/"
+        "zJADWuDmB9zmotPxmgqoYANtFnY0/w1bAahwDWuTHP8pMB3Lj7A9YJv67xkwEsgfiAzU1qL40yQBURAWwOoGv9ZEALrD9krTzJOwiXAd3w+0NW"
+        "695BReg8YNt/B7KK8Bt1UeIBW6McyNZiYnEjCKxf3ZerV0psiYLyVXyqhANZCzS4xQ8PUMVFJNtnW1xpk8DdkSLZzJ2p7RUPWOPqQLaiEDJF5g"
+        "Gb6AWyPmuLuubygDWuDmSdR+gl+otNtj5cFeylmw3IUT2JxmNt/iGbYTLF5Txg+/V8yHhhdaHzqPI0tJ8YE5qnnf107xkq3YbqDwzI8HUlkI2c"
+        "yaqNqA6ms0Jl1U5kPJ1gLWSK40TGw6QfltS0t+KjUYNvqKzaiabDAtmhzUeG9XhK75SzQWXVTtTv/l5QWbUT9c7pBZqOOFHv+1qgltVOtFoLzH"
+        "1vKYcTVR/bMBmNJRlO1Omy5IJMK5wofoewA1A3qnyfe+arNHDPG0PqvtSaWGm1IzWRTKDUJz0pZFqvzUKUH0V+ssbHh4KW9JGxNZb51WhrBygD"
+        "fKSlRKXXDu5PY0h792gvnvTypuITVqy02pF692RQq8jH+0aRtsUMSn36a3N5vdo5FVDXqMdtRpFmSj4buuJxPKqjHf8scI2jIP9NcfX6a/tqag"
+        "Oy842SXgelhRoJTVGHFMxBqbcgi2TZo23XpCNw6nmSoR7WB9mEgjT7km9wm9Ci0RMtiyrZRyx2L6z3QKqrT7RZvtYmB6cdc5zvq+GBloktX4vO"
+        "v2vZTOwZ04EW5WySY1N6FROpu+rkQItCYklTY9ITYbo4+Qp9oGWt20Exuz/vFfCGHm6daFN2L3JVKQs1C7vm5EDLbjjZSnR+OgfoRM0d/CJaNr"
+        "J2KLoSTz9rYi2LDrRckOtFeX4doJM126g70FbqQJJ9Ot3PmE0h34c80LITufbMKgf8oI4Arjc50HLBdpFyMd/7XRSk7Pogy+X2JEByqbTjiAL1"
+        "sj7RcsEdEJEfVUKZ6LrSJJLt8w1q370fmAw6R+zP5/uirfKnFqkHujH25/NV+/NFyyNxk/TkRw8odFchguViff+mi8TtGPXV42L9BcvsQitioX"
+        "IgkG2uW1hHshmutjGoHKhn7FFpJMtydF9zctHFnRZUb32gTZBI3U+ptCQnqNz6QEtAQQLl+ptZ6xqBOy4RbaVNeYc1M8F0uh71RrREaJWdl/eL"
+        "N6jrpQe9ES0hKD39lV7ME+25FdASY4/9JjJ9yQnVzdgdZQPahNbzblzRhSrvf+msP2jJkrgbCOUXrYFtvr5kq6aiDs77naC85x4zmYA2/9q0Pz"
+        "JFUSBxhLdtiWjZOdHSzR1EgXqWP85iAS2lFcTqtDilgVVXH2i5Hj2StPbuexa0gex9Ww62lYxNOhin/lQg27v2qhn7sr3zDglR9vKB8h9x7drB"
+        "livu2KJKiHj3CRVXn2z7Vu/ZuNqqgAoBHiu1yJYrFikNynv2yQUqrj7Z1tJoUOCdx85oMlRdfbLt6b/JRrTQGSa2P19k/0linSbHPjK8tFtVFF"
+        "aYyfBpuv7hqlJmksKeB6yxwResF8vsqJqh5m1frKqNlvjELszx09PA4gu2i7GSa0HVB1+sfn2lshEzqMS5PKKmD1hvQqqBpL9Q5+oP1tRTVDnD"
+        "A3QTKIBVPJUKq5xSgUqrI9j81EQFWjG3hlfAB7C5qO+EUQaoRVwAqzd8q+zi3jB3okurA9ha3a/ykwEqrQ5gPRNsvf1kAEurP2AVjbNMeKAEyC"
+        "6tDmA9jbz3Ay8DdL8ggPViK/NrK2P1EZGsZQWt/Pgvtk76w7VyGnKE5QHrSRfIerUdV/BfbKXyh2umoYWreSqqkezLPPRNNs9qMZbGO1Y/XBXQ"
+        "0FmODFilRSDr80ymMjJgdReB7FUgSYo1wO3DA9nq/qhFCK7x2UuT8SHrApOpdQcPWIVGIOva2UkgzANWrxHIGhZQy0UZsLLqQNaI56aTsIXye3"
+        "63In+R8bJqOtkar5KnhFlJ+qNTe3a3605IJ1R6YES9m+vC1pUaUfGgppmvJj1Pr0z6R0dmNgZUeMcknn6cbkT9YUFWJvX5YR8DE4rmEtYpzIi6"
+        "eg1Q0+Xqz9R4dpcSaovnVfP52tipqGYDXuVZ300G5k61oEeyTmRhcrpGgrbJcaIWcmD0+K6qVqBKwhvoTPB2SXjz2ZIUORjdpKUQTlRH4z6w9Z"
+        "iOVLl/xna4MSLT6RSzQ1MDR1qZC8hvOL/qXNxvuNWd52PrKh1pftWgA9a3X7UHCu1GeUU+ftX3yySyUk6NFVU70ustoNG8EXVWu6HBuwJ5Qh6o"
+        "Openucx4FbqQOxq25NGImgGvMrBiakPqWt4n9qxBkf+kmLrefymmzpX6fszf3F/t0yNiTxXU1XtSz9YElFIfYJPh1sEvJsxu0XxEuB+wbD6kq7"
+        "ZFL4LcV55WpIEs9/PN1jYzkYwNK6IOZNNblMaWtqCs2eUkkSw7VLQmDrG0HViTnkCWySdfo3LT4oIpj8++hRnIj7xjcYfrCTWpPsiSZ5Sd1JCj"
+        "7ewDawv0BXsr5L1+0NeM+SrfSpIP2YyAyaCeLM4xeawLSSJZjq7TRXEJiS96yVgnooj2C07RXtyYsx4Xkhxo+0JXn2ygi3E4cBlJJNvt0m5Ser"
+        "BdKDYZjmh7GKYKPWaFSqZPtDzsS0w00ySXWahX9YGWC9LeKinFd1Y3oIXPJ9oqiCp1T6Wtn1GQqukTbYsR30m5XQ1jijRfq9EXbYvtWJN1LJj9"
+        "Jj+WjGQJJfJegTsXFySQw5TbWUW0RErlIlNw2p4C7Sx4QWYgmxj2HlI8AUqm10sM+0XLNmSjDVV+FdWNyOXTB1v2VfuVqK9IHrAiURdQH2xRbI"
+        "+djpT9aocpx54WwpEtxzaLGmFxScosWMPqky1XzDuXpl+XoqqGlVEfbDks6rJI5pvKU7BC6oMtV6QZgSzl9/IF6q3kwe/BliOqPcmS81aqKD1J"
+        "epq0RLbXatAzk/Y6AhIcl3e1xodttWeFfPN3gHzfCyqpPtlyRfFEpNYH/caKqk+2fcZMNWl3om4nWE+xg22/4/6ef+y+jNVVH2i7U9NMJO4Gye"
+        "KfAsIv2Z7EmrjBUE/YHtEH2noXDSrkmCijpvQo1gLaZtN7P6hUTDWwXtUH2tYL2jybdWdUC3zOH9C2Iu7EhgpHGqjKwHVyES1rfrvqfiqpMAbr"
+        "Uh3JEtPsr3i/nx1ANtDD4BubX/Qfbaonpz0yvJxzSObBA1I2ELh2TEvu1TxAN94CWC9W2vzJALaq/oBV0EQ9NGSA7oIFsB6mz8GqI1TntEfO9A"
+        "GrqHT29JMBKj8IYNNOFRY4FbAU4YU1XW4W+WzGNtEOYGu4vFMCGdAttd9g86KkG4YHcIPtD1gVWncqPxnA7bY/YBNoUUK8UPtrXmEewFIRTZuJ"
+        "PxmQ4oYIVmV/H1xv0gdU6xDBerFSuLKggDJ6r2P/gvVimUrgeEBuH0SwXqzebAJbQeef91OM8SHr1WZqPxmwNtWBrPdjpXoaHrA21YGsjxpbPC"
+        "x4Kh3JOouUvZLLgPWoC2Qzk9vJkgxoy7oP2XzaK1vqopTOrqsOZF3W5s7hZQB3Q/qSrd6EAiEesLrqQDZha//xX2yG9+FqMEfbIjJgNdWBbA0R"
+        "EpegrATOtQJZo2KuiJqoUqtHUx3IVlVwS8JxZ7Sk40XGa6rbfS2vvGsJ5ZXwyPgeh4RGpdMLmQ45Uc2qQT1EXmbVT/MQassGPfc3oIo/QYZXlu"
+        "I4kfFUPYfMaQxo/uaYdN/SGCeqqvde2A47RlRLS4zIy1vqKFD9OCdmpfcjZCNalRumiOnVNafll0ANdJY5nu2L1xHm2Pf/+A+2M879FHpRnTS0"
+        "k68TFV8wOcx6YoHyONG2K4OPIa/82upooP1/L8I0pNWhNbBlUn95lLF3Q4ImB47UasR0YxXVjtQyi1QmtqjSkGLZsX+MCQ35HWke6iDBvAX5jt"
+        "Qpfw6wCY8hVfPcC9am2pGq2M4NWxLpSOb3qyesrtqRVi0ysI07HamB4A06nbeg3JGm+IcG4Qz8N1XV6W9V1Tve2d8ZHzXPu73M8wor68bVMSFK"
+        "fbzzvmQ7WGtVlIOg5o8vocmXLNfbzyN1IaPj7o494jnQ3o6ZzEHvfIHkQv3VjPlNtoPR3uRwHRSk+Up4oOWC8yr7U7P1HPRcKYDNSZnOB9e4Eq"
+        "a0xp36Itk+212beINCxdUH2S63yG+uoDQXfpIVyXJnks3qJOEAaA/VXakjWS6XKQonPTmq0NYPmQJZLtfYN3ru3xV7fhbAcrF96T2XkkYB0zXR"
+        "+59HskzSVBg9pfCgIoXVB1kuN9lCb5IfGjQpPsjmp3rvN0RVHJgdaZeSRLJcbrJcZ+ZrYA5lfHczkq1uqdI3TI2fEjRHj2S53OQen/zihOqpI1"
+        "kSyCrf8P7IoDopP/kPZLkcaXUS/6ADu2UQydb94S58t2I2th4p9RcsF9uRd5FHEZOTuJA6kmXPKF/95ommYuSwvoERyXI5Eh5PmkUXKKNwFXVE"
+        "y/X275kLrxELK6EOZNmHoBO2zAvgBO+nRLRcr7DKag8ZpBB/Gq8EtF1vL7iLiuUTVjodyHK1yh12d2yWQUrtZ3cnoO3T7ZyXy7XywqqmI1qul/"
+        "ckk0QQCyp497j2YMsV74ua6bCffwIbdwW0PH1Dej/fpHDqUMn0yZYr7mRsic8wWDF9oK2sp1bpydAndgvsZMv60PmolvN3kFuex7gH28uS0+Cq"
+        "O1Qr8vYuTP6w3Xp+Lx1k3ozaOH5O1SNbrkii9MKvohQKHu0ebInQ2jWp0VTaaTXoDNoD3oMtV7w5p+D30cAuaQfbiqZKT/Jdo/XTB1uueMurdD"
+        "+BdC0e+R5sK9Oat9zBN1pFHdh/tKJe11w//vtSMJX0kwEpog5cvRaZANJf6P7aB6tCqZa493gDNa98vP4+YNVJZdIyYXuwvaB6kUUX5gEqnA5g"
+        "M2zL6ScD2rftDbYOoOQ9zANYOv0Bm1fcGj8ZoJs/AayHsvVePxmg4ukANrH7nghkgG7FBLAeB98kS+cBKp4OYG9gzK7KaUErzSPYpXpTNHUTqm"
+        "QIYBc05F+G9WD96BpeYL1YH/w7dsz2/0vl8AGb2KG0nwxo0cMbrA/1jn5/MmA1EIHs/a7rTwZsBh/IOhWT55AMWH1EIJvkt/Fi0EGJQ36WmQ/Z"
+        "7Owrl2UsVEXwy8/+Tdar5dF+MqDF0x+yhjo72OW/WOn0h6tXSo1fSg1sSB3IKq8fjSPIAdoua09o+iHr1eqqPxmgSV4kW+nAEIE/qCN8f8p0Pm"
+        "S72uLPWxZWPB3JerU2+PO2gTWkjmS92qRdAh7QhtQvMl48TS19Rn+pujBr5UvTNV5S0gIq+Xa3JSWqZKyDJHveTUqJqrJNGGuj/Mhs0+No1FEN"
+        "vyzRcaLq0Qo0szEgwxeqX7WlMk5UrVtuUPm0ExmfqekwMl1xogrXQc0wLUFxogr17go1pHai4gvmrrckxIkmM8QKqJ2o3/1s0I43TlQ8tCpTeX"
+        "pT3g2qnnaiFjyMjq27dKTOCBm0yHvfGkOqLe8AyV+9V40hTR5cwP1p+suIvdSrTawhtSN1LUx1oeXTyaeFva7PgQ30HektibDqaSUqHVQD78F8"
+        "eVe/5x1kg95+e/pR1Uf1tFAl2k+143oVZ9M/FtaV2pHK7xUrnnak/r6pYfvCKPL//wLq/TH/1//mV/6f/02RLt2/kg3IB/rP//t/ABBY4SRjdQ"
+        "cA"
+    ),
+    "002": (
+        "H4sICHoHyGoC/2NoZWNrYm94X3RvZ2dsZS50Z3MA5VbbjpswEP2VyM8WwuaW5QP6XKl9W6HICyRhMQFhutko4t87Npg7G22aPmyrCGxmxjPH45"
+        "kTX9Eb8pFjeIaNMNqXyHdNjJIC+TDkMJAtTM7IdwjF6NiOpwwWZZG1C49xmL7k77sqPxx4vDsfkyreWQJ8RVGknDAh4kog/znAiLNLXMr5tVMn"
+        "JxgJRtUF+XbrWXndZKyqYnAkSmWQwroryuWLqZUpiE2zxqgcyaSkGEmeTQy/AORsRS7GcnCL2yeo5bJcqcSRFXGDXqJFhxINAcNHUvVacdTa76"
+        "yS83Qc5YoSMJYYAjx4Q5byFfmblFNiYupKKbUppk8UZpbpYkpdaRMif8+4iGvA3QKpMg0kKtkZTXcr8xW3EtLsHxY2G5Y5CpRajXD8RLmFMqBj"
+        "tUwVbk7nXYoNwIUuaqYynPQar9UQQ2VXufNad42b3uEgIqEzm0lIeyWkDDQPSSz7wx0S70nra+kun2Ut08bquCud5R9VmaeycMNJVWH1m/tqqv"
+        "g8kllSxMEDbJq/qiHjqkNeMhVdH25Xgz9LdhL7vJSnPa//5epfr/1gsa+WcIt0ZibYRAQJDOasIpoqUxsCAojadI6YgY6ZAajmazACAN3sE84n"
+        "pFCG2kAqN2UcyrJpGHACkTrQ1I67BMaGMrLJ/IiIazh93++5jvWtAfK5emxyfEe1DYCzm1taYhzDJFi+dF8Ovgf9aa+Y62P6AzZyth3T4BEj4T"
+        "krWeaS7RDU3TCIvf1URnrG6vT1w/sYL5Z6/qviySlerfZWf2/BW08YnlsF/2AKpt5/R8HwRWcUbI0puEyKgn+Re1mHdViVMZ+pi3t4ioAVPJod"
+        "uq9BR1rukin1wL3nTqjBWeUG11kgB7flht7ZKgpCzb8Gg+iLoPZWB0v/QE2m9T/i7a784CJqmcs5tlZuhfcmdi1el81HBST9XVrTNflXOQYsfg"
+        "M4sb7Bcg4AAA=="
+    ),
+    "003": (
+        "H4sIAAAAAAAC/91YS4/bNhD+KwKvlQm+RfmWtOle9lAgi14MI1BsbSz4IUNS0mwW/u8dPkTLlLQNFmmAFoZJi8MZDmc+fhz5GX1BSyRxhgVK0b"
+        "HsCrR8Rp9g7L7uuqr8vTqUbfLmXUIwxYzAHJiAoNu7buu6bmP6S4oeG7RUJEXVGS2hq6HLof8LLSVlKdr5/nSE+dvyUHblh1PdHItD9a3cftiU"
+        "p65s4MehBk2wvt1aM0Xbll2Llqt1ig7FU9mY389BXJ2gp+DFE1pyb/zXh3sw0DZWsG/NrmrTFFZj7/S+gpSC182khIDkbCSg3TWfyxR9vZmXET"
+        "+Tw8QnL6JWBM5VZgCEK4icVGs7Y0XXMLUeSLTwEoKJYkbagQ2JtYYomV1SIiVmmQLRjc1csqCpMxbZ1SRIvU2msMios6lzjRmsbEyCiGeYyDxe"
+        "bu32Ji4Xm/PBvlckhY+Xm/C1L+xdqSwlgByW2t99HFL4RD5LSs0cxqHlnPf+27XcHsCzXDg/c4pFahtKSBwbzY2N0F7jFMbjtbmTZPNrU3BQ6z"
+        "5IDBPwJOMYwNw7YCZpLFk+6aEPl7LhrB3Ibs9I29nHj0fbnYsGDgPs2Zi+ATpzQBce6PfV9mWgUzIF9alcyXwGppLoCE5DiI7iL6ScwzuTIRuc"
+        "U29MSEw8MjEfGdOzxvTAGJU9SADbXDpzC4VZbG8AwhgERA6OlPD2lMaaedQxnOXh2GQKZ0qGEKx/NGswMZsOlkfpGJwMKTSAc7Tt/Eo0GURgaJ"
+        "DGuR1AXUkyZU1yOuMbC1wHoea6Nzk4GJBQnOuRfyTsCQsRWxV5DECWY0q9k7D3KSd12PMix0TzGD6kB8KCUkyVGqFRcjVpN+gxrMjIbC8EnwKI"
+        "hqCUYsZbr8gwHyGd6iAkmk4gU8qrqxE2AyBeYHQJoGSQaqbpJLP7aZpintrGcNqY0dpdcS7d3WwoCn1qgJqqziH75DjMCtod8ov0nBUWsUFZre"
+        "wN893t2obrFVpfjBYDmjb31IL5+2JFAQSas+EIEYARmKMYBpoAzIwGrA4f6CzGhsOQ17p5BH82jjQuLjrs4kn+j6LbJdRUaCd4evPb23fJn+Wm"
+        "q5vkvQl5skjumvqzKZl2EOXH4tCWFgkm1o8HZO0OE2nv35QGRKRzd4Z0VwYN95J1B6rCQ8Km3LlrivOu2oBDZs5P9Ye+0p/OgPQ8Pg9UZyZFIR"
+        "HjImj+oBh/r0eEz5WYan6jmTG6n1Iy0WmLKYns4fLQFKf2EepqZA69HbL4sDE6nW2VvLH7CnH0h3EigDGu1q+uXPht5fK23j6h63z6iipmpmAf"
+        "ZmnBuQipYtPUZ74v0Z7GeWqbn0R7C08lQ7pyQzOsFwkn1GPOWwDdp4xoV+4CeyllicgTkmG80citinnydKYssw2f/1tU9qOpQ2ruXyP+j+TB/j"
+        "XyGDGGvH2pf7h7n7j/CH5pq29lEv46+IdX/XEIx0zBTAWVutYWmVHKoG4HiWutPMoah2pMp661b3zf9aJnAnIsmr37S2N9+RvcLpIBkBEAAA=="
+    ),
+    "004": (
+        "H4sIAAAAAAAC/91W246bMBD9lcjPVmRuLuJXVgixi0lojI1s2mwU8e8d2xDCbRU12YdWETHMMWcunjPiin6jBEX7H/sQYVQqlFCCUdWgBBYJix"
+        "fDzRklkedjdOxXUcNLdRFkKi8qmTWKaZ1JkR0lL4ansszOx6plWaAzVTUNZxmX4sBU5kUk+2CiZYoV4LQoCust15q1GiVvKUY8vzBl7q83uBKw"
+        "ehi1F5SEixDmToBXK7v/BDRXJM1fbolOYCakw0hNbMbSTCxvfkSxuUgKWP4FpqcYJIjtRQA1r0oL6WPeMJeUSQIdTJQ2DynYDlCox85lAUDVjj"
+        "sZH3be4PVQ74PxHAIUzrsJzA8xXKk9Sa/DFosWIDOEARAGFJ5s6T7BRPZ+BM8Xe2vzrkaIDpC3t0lb6th31CPZnV8vCL/NsUfpV55jMkW7/kVT"
+        "63JW611ZcWP6mJ0xtj8TjNwuOFkvtU/7ZMlr6ks2KvsqP7dyko1CElNCqygowntt1dTXs711eatyoUup6mX7klWNkXV1kV5Zawpe07k+LbbpfG"
+        "bq0nncd+r8BaMKhCkOm7JknFeNfkyXQxp914+dp9uBTrdKnthDTXef6Hlqi8HEgQGahP+0S83t7PzfDqgSAg6okO3m+Tjsr2amy9FaAjqanK6o"
+        "j6n/nLaGmTBQGdooxFH4HC3taR3VoFd/Yn1ZDp4fL5NwVXqGNQwXRzBOHEw2xvbD83r2LfDPT650+eGmXR/3ePcHt7QU6+4JAAA="
+    ),
+    "edit": (
+        "H4sICJsNyGoC/2Fycm93X2ZvcndhcmQudGdzAK1U727iMAx/F3/OqiSE0vUpJt19q6opO8rBtVCURGMI9d3nOCmlpbvTdhNqYv/8Pza+wCvksExWiQIGGwN5"
+        "yhnsjpDj1eIlMiROkC+FZLCN92GPRsfWumdtTHt63rTmpM0aPazXazLV1lbOQl6UDBp9roynL1fx7oC3YODOkKu/+bOG9Go0v0DrD00OaoQ57xiYEeaRY0QE"
+        "IRjUkdQnIJcp8x/HrKoJj7WJjpG2+Egd36LnKZc3BHmyQPZMFC8x/m6QpFEivCQ6lyo6v3E2zeXLzhfZB5mveKI8kvD/C7Dsn2bi8NsqSOXnWrV6nOp3Pooe"
+        "jcWtlNRvZThHLH4+C9BtmJetPlZhav2Uwm8DcVBpRpHZuUFqt730STtP1+MoF/8/K4oFlic51l1I2VNCKXxEmeEZcORQL3CPmafLkt6tKOix4/mAD8oe1CLh"
+        "q8yzgWI86VVCG3qjsZyMr7aDW7T5BflGN7bqQks+Ux2XTChf01Cnx2SazlZwn+Q/E3F9Ij+caesKSGvUTUY/3+e5dXEaYSpDqEEPOHTNH7r2DW2klz0tkxjW"
+        "XXv/0+iDxfW0h2HRxMg8TJeeRednrpxdYHN52/pOzeoJhINf3u9uG9ZfKKjs3gH5B0GI8QUAAA=="
+    ),
+    "folder": (
+        "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"
+    ),
+}
